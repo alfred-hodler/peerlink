@@ -1,9 +1,10 @@
-/// Unique peer identifier.
+/// Unique peer identifier. The user should assume these can be reused by different peers as
+/// peers come and go, i.e. they are not assigned just once for the lifetime of the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PeerId(usize);
 
 impl PeerId {
-    pub fn inner(&self) -> usize {
+    pub fn value(&self) -> usize {
         self.0
     }
 }

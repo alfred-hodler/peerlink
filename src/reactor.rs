@@ -241,11 +241,10 @@ fn run<C: Connector + Sync + Send + 'static>(
                                 let _ = sender.send(Event::ConnectedTo(result.map(|r| (r, addr))));
                             }
 
-                            Command::Disconnect(peer) => match streams.try_remove(peer.inner()) {
+                            Command::Disconnect(peer) => match streams.try_remove(peer.value()) {
                                 Some(mut stream) => {
+                                    poll.registry().deregister(stream.inner_mut())?;
                                     let _ = stream.inner_mut().shutdown(std::net::Shutdown::Both);
-
-                                    remove_stream(poll.registry(), &mut streams, peer)?;
 
                                     log::info!("peer {peer}: disconnected");
 
@@ -256,12 +255,12 @@ fn run<C: Connector + Sync + Send + 'static>(
                                 }
                                 None => {
                                     let _ = sender.send(Event::NoPeer(peer));
-                                    log::warn!("disconnect: peer {} not found", peer.inner());
+                                    log::warn!("disconnect: peer {} not found", peer.value());
                                 }
                             },
 
                             Command::Message(peer, message) => {
-                                match streams.get_mut(peer.inner()) {
+                                match streams.get_mut(peer.value()) {
                                     Some(stream) => {
                                         stream.send_message(&message);
 
@@ -273,7 +272,7 @@ fn run<C: Connector + Sync + Send + 'static>(
                                     }
                                     None => {
                                         let _ = sender.send(Event::NoPeer(peer));
-                                        log::warn!("message: peer {} not found", peer.inner());
+                                        log::warn!("message: peer {} not found", peer.value());
                                     }
                                 }
                             }
@@ -297,6 +296,8 @@ fn run<C: Connector + Sync + Send + 'static>(
                         Ok((stream, addr)) => {
                             let peer = add_stream(poll.registry(), &mut streams, stream)?;
                             log::info!("peer {peer}: accepted connection from {addr}");
+
+                            let _ = sender.send(Event::ConnectedFrom { peer, addr });
                         }
                         Err(err) => log::warn!("accept error: {}", err),
                     }
@@ -390,7 +391,13 @@ fn run<C: Connector + Sync + Send + 'static>(
                     }
                 }
 
-                _ => unreachable!("incorrect token allocation"),
+                (_token, stream) => {
+                    log::warn!(
+                        "spurious event: event={:?}, stream is_some={}",
+                        event,
+                        stream.is_some()
+                    );
+                }
             }
         }
     }
@@ -501,6 +508,10 @@ fn read(stream: &mut MessageStream<TcpStream>) -> ReadResult {
 
 /// Causes a stream to write into its underlying stream.
 fn write(stream: &mut MessageStream<TcpStream>) -> io::Result<()> {
+    if !stream.has_queued_data() {
+        return Ok(());
+    }
+
     loop {
         match stream.write() {
             Ok(written) => {
@@ -542,7 +553,7 @@ fn remove_stream(
     streams: &mut Slab<MessageStream<TcpStream>>,
     peer: PeerId,
 ) -> std::io::Result<()> {
-    let mut stream = streams.remove(peer.inner());
+    let mut stream = streams.remove(peer.value());
 
     registry.deregister(stream.inner_mut())?;
 
