@@ -22,7 +22,7 @@ To enable socks5 proxying, build with the `socks` feature enabled.
 
 ## Usage
 
-Please refer to the documentation or the supplied [examples](examples).
+Please refer to the documentation or the supplied [examples](examples) and [integration tests](tests).
 
 ## Disclaimer
 

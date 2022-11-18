@@ -24,6 +24,9 @@ pub enum Command {
     Message(PeerId, RawNetworkMessage),
     /// Close all connections and shut down the reactor.
     Shutdown,
+    /// Causes the event loop to panic. Only available in debug mode for integration testing.
+    #[cfg(debug_assertions)]
+    Panic,
 }
 
 // Event variants produced by the reactor.
@@ -173,6 +176,19 @@ impl Handle {
             ))),
         }
     }
+
+    // Attempts to receive a message from the reactor associated with this handle with a timeout.
+    /// If an IO error is produced, it means the reactor is irrecoverable and should be discarded.
+    pub fn receive_timeout(&self, duration: std::time::Duration) -> Option<io::Result<Event>> {
+        match self.receiver.recv_timeout(duration) {
+            Ok(event) => Some(Ok(event)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Some(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "channel disconnected",
+            ))),
+        }
+    }
 }
 
 /// Runs the reactor in a loop until an error is produced or a shutdown command is received.
@@ -285,12 +301,16 @@ fn run<C: Connector + Sync + Send + 'static>(
 
                                 return Ok(());
                             }
+
+                            #[cfg(debug_assertions)]
+                            Command::Panic => panic!("panic command received"),
                         }
                     }
                 }
 
                 (token, None) if is_listener(listeners.len(), token) && has_slot => {
                     let listener_token = usize::MAX - 1 - token.0;
+                    log::trace!("listener {}", token.0);
 
                     match listeners[listener_token].accept() {
                         Ok((stream, addr)) => {

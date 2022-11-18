@@ -3,9 +3,10 @@ use peerlink::reactor::Handle;
 use peerlink::{Command, PeerId, Reactor};
 
 /// This test is designed to start one client reactor and one server reactor, send 10 pings from
-/// the client to the server and expect 10 pongs back (interleaved).
+/// the client to the server and expect 10 pongs back (interleaved). The client must shut down
+/// in an orderly manner.
 #[test]
-fn interact() {
+fn pingpong() {
     env_logger::builder().is_test(true).init();
 
     let server_addr = "127.0.0.1:8333".parse().unwrap();
@@ -15,7 +16,13 @@ fn interact() {
     let (client_reactor, client_handle) = Reactor::new(vec![]).unwrap();
 
     let _server_join_handle = server_reactor.run();
-    let _client_join_handle = client_reactor.run();
+    let client_join_handle = client_reactor.run();
+
+    // We are using this because there is a split-second moment between the server binding to a local
+    // socket and registering it for polling where it can miss notifications. This will never
+    // happen in practice but it is essentially a race condition that can deadlock a test if the
+    // running machine is fast enough.
+    std::thread::sleep(std::time::Duration::from_millis(10));
 
     client_handle.send(Command::Connect(server_addr)).unwrap();
 
@@ -72,6 +79,9 @@ fn interact() {
             _ => panic!(),
         };
     }
+
+    client_handle.send(Command::Shutdown).unwrap();
+    let _ = client_join_handle.join();
 }
 
 fn message(handle: &Handle, peer: PeerId, message: NetworkMessage) {
