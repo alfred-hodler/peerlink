@@ -7,6 +7,10 @@ const MSG_LEN_OFFSET: usize = 16;
 
 const MSG_PAYLOAD_OFFSET: usize = 24;
 
+const MIN_RX_BUF_SIZE: usize = 128 * 1024;
+
+const MIN_TX_BUF_SIZE: usize = 128 * 1024;
+
 /// This trait allows callers to check if the item is in a usable state (connectedness etc).
 /// Useful with streams that do not guarantee to be immediately usable.
 pub trait MaybeReady {
@@ -20,12 +24,10 @@ pub trait MaybeReady {
 pub struct MessageStream<T: Read + Write> {
     /// The read+write stream underlying the connection.
     stream: T,
-    /// Reusable read buffer for reading from the underlying reader.
-    read_buf: Vec<u8>,
     /// Buffer used for message reconstruction.
-    in_msg_buf: Vec<u8>,
+    rx_msg_buf: Vec<u8>,
     /// Buffer used for sending.
-    out_msg_buf: Vec<u8>,
+    tx_msg_buf: Vec<u8>,
     /// Cached readyness.
     ready: bool,
 }
@@ -34,18 +36,17 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
     pub fn new(stream: T) -> Self {
         Self {
             stream,
-            read_buf: vec![0; 1024 * 1024],
-            in_msg_buf: Vec::with_capacity(8 * 1024),
-            out_msg_buf: Vec::new(),
+            rx_msg_buf: Vec::with_capacity(MIN_RX_BUF_SIZE),
+            tx_msg_buf: Vec::with_capacity(MIN_TX_BUF_SIZE),
             ready: false,
         }
     }
 
     /// Reads some bytes from the underlying reader and places them into the internal buffer for
     /// future reassembly. Returns the number of bytes read.
-    pub fn read(&mut self) -> io::Result<usize> {
-        let read = self.stream.read(&mut self.read_buf)?;
-        self.in_msg_buf.extend_from_slice(&self.read_buf[..read]);
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.stream.read(buf)?;
+        self.rx_msg_buf.extend_from_slice(&buf[..read]);
         Ok(read)
     }
 
@@ -53,7 +54,7 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
     /// for several reasons: the buffer contains only a partial message, the message is malformed etc.
     pub fn receive_message(&mut self) -> Result<RawNetworkMessage, DecodeError> {
         let msg_length = self
-            .in_msg_buf
+            .rx_msg_buf
             .get(MSG_LEN_OFFSET..MSG_LEN_OFFSET + 4)
             .ok_or(DecodeError::NotEnoughData)?;
 
@@ -64,13 +65,13 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
             return Err(DecodeError::ExceedsSizeLimit);
         }
 
-        if self.in_msg_buf.len() >= msg_length + MSG_PAYLOAD_OFFSET {
+        if self.rx_msg_buf.len() >= msg_length + MSG_PAYLOAD_OFFSET {
             let decoded: Result<(RawNetworkMessage, usize), _> =
-                encode::deserialize_partial(&self.in_msg_buf);
+                encode::deserialize_partial(&self.rx_msg_buf);
 
             match decoded {
                 Ok((message, read)) => {
-                    self.in_msg_buf.drain(..read);
+                    self.rx_msg_buf.drain(..read);
                     Ok(message)
                 }
                 Err(err) => {
@@ -86,8 +87,8 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
     /// Takes some bytes from the local send buffer and sends them. Removes successfully sent bytes
     /// from the buffer. Returns the number of bytes sent.
     pub fn write(&mut self) -> io::Result<usize> {
-        let written = self.stream.write(&self.out_msg_buf)?;
-        self.out_msg_buf.drain(..written);
+        let written = self.stream.write(&self.tx_msg_buf)?;
+        self.tx_msg_buf.drain(..written);
         self.stream.flush()?;
         Ok(written)
     }
@@ -96,7 +97,7 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
     /// the internal buffer. `write` must be called when the socket is writeable in order to flush.
     pub fn send_message(&mut self, message: &RawNetworkMessage) {
         message
-            .consensus_encode(&mut self.out_msg_buf)
+            .consensus_encode(&mut self.tx_msg_buf)
             .expect("writing to Vec cannot fail");
     }
 
@@ -108,7 +109,7 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
     /// Returns whether the send buffer has more data to write.
     #[inline(always)]
     pub fn has_queued_data(&self) -> bool {
-        !self.out_msg_buf.is_empty()
+        !self.tx_msg_buf.is_empty()
     }
 
     /// Returns `true` if the underlying stream is ready. Otherwise it tests readyness and
@@ -119,6 +120,17 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
         }
 
         self.ready
+    }
+
+    /// Resizes and truncates the capacity of internal send and receive buffers to their size or
+    /// some set minimum, whichever is greater. This helps maintain memory usage at sane levels
+    /// since keeping permanent large receive buffers (e.g. after receiving a block message) would
+    /// eventually exhaust available memory on less powerful devices when managing many peers.
+    pub fn resize_buffers(&mut self) {
+        self.rx_msg_buf
+            .truncate(MIN_RX_BUF_SIZE.max(self.rx_msg_buf.len()));
+        self.tx_msg_buf
+            .truncate(MIN_TX_BUF_SIZE.max(self.tx_msg_buf.len()));
     }
 }
 
@@ -169,6 +181,7 @@ mod test {
 
     #[test]
     fn reassemble_message_whole_reads() {
+        let mut buf = [0; 1024];
         let mut cursor = Cursor::new(Vec::new());
 
         ping_msg(0).consensus_encode(&mut cursor).unwrap();
@@ -176,18 +189,19 @@ mod test {
         cursor.set_position(0);
 
         let mut conn = MessageStream::new(&mut cursor);
-        let read = conn.read().unwrap();
+        let read = conn.read(&mut buf).unwrap();
 
         assert_eq!(read, 64);
         assert_eq!(conn.receive_message(), Ok(ping_msg(0)));
         assert_eq!(conn.receive_message(), Ok(ping_msg(1)));
         assert_eq!(conn.receive_message(), Err(DecodeError::NotEnoughData));
         assert_eq!(conn.stream.position(), 64);
-        assert!(conn.in_msg_buf.is_empty());
+        assert!(conn.rx_msg_buf.is_empty());
     }
 
     #[test]
     fn reassemble_message_partial_reads() {
+        let mut buf = [0; 1024];
         let mut cursor = Cursor::new(Vec::<u8>::new());
         let mut conn = MessageStream::new(&mut cursor);
         let serialized = encode::serialize(&ping_msg(0));
@@ -195,31 +209,32 @@ mod test {
         let pos = conn.stream.position();
         conn.stream.write(&serialized[..10]).unwrap();
         conn.stream.set_position(pos);
-        assert_eq!(10, conn.read().unwrap());
+        assert_eq!(10, conn.read(&mut buf).unwrap());
         assert_eq!(conn.receive_message(), Err(DecodeError::NotEnoughData));
 
         let pos = conn.stream.position();
         conn.stream.write(&serialized[10..20]).unwrap();
         conn.stream.set_position(pos);
-        assert_eq!(10, conn.read().unwrap());
+        assert_eq!(10, conn.read(&mut buf).unwrap());
         assert_eq!(conn.receive_message(), Err(DecodeError::NotEnoughData));
 
         let pos = conn.stream.position();
         conn.stream.write(&serialized[20..]).unwrap();
         conn.stream.set_position(pos);
-        assert_eq!(12, conn.read().unwrap());
+        assert_eq!(12, conn.read(&mut buf).unwrap());
         assert_eq!(conn.receive_message(), Ok(ping_msg(0)));
     }
 
     #[test]
     fn reassemble_message_excessive_size() {
+        let mut buf = [0; 1024];
         let mut msg = Vec::new();
         ping_msg(2).consensus_encode(&mut msg).unwrap();
         msg[16..20].copy_from_slice(&[255, 255, 255, 255]);
 
         let mut cursor = Cursor::new(msg);
         let mut conn = MessageStream::new(&mut cursor);
-        let read = conn.read().unwrap();
+        let read = conn.read(&mut buf).unwrap();
         assert_eq!(read, 32);
         assert_eq!(conn.receive_message(), Err(DecodeError::ExceedsSizeLimit));
     }
@@ -233,8 +248,8 @@ mod test {
         connection.send_message(&ping_msg(1));
         connection.send_message(&ping_msg(2));
 
-        let buffer_len = connection.out_msg_buf.len();
-        let cloned_buffer = connection.out_msg_buf.clone();
+        let buffer_len = connection.tx_msg_buf.len();
+        let cloned_buffer = connection.tx_msg_buf.clone();
         let written = connection.write().unwrap();
         assert_eq!(written, buffer_len);
         assert_eq!(wire.position(), 96);

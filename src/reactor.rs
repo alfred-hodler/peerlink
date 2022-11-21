@@ -218,8 +218,10 @@ fn run<C: Connector + Sync + Send + 'static>(
         })
         .collect::<std::io::Result<Vec<_>>>()?;
 
-    let mut streams: Slab<MessageStream<TcpStream>> = Slab::with_capacity(32);
+    let mut streams: Slab<MessageStream<TcpStream>> = Slab::with_capacity(16);
     let mut events = Events::with_capacity(1024);
+    let mut read_buf = [0; 1024 * 1024];
+    let mut last_resize = std::time::Instant::now();
 
     loop {
         poll.poll(&mut events, None)?;
@@ -334,7 +336,7 @@ fn run<C: Connector + Sync + Send + 'static>(
                     if event.is_readable() {
                         log::trace!("peer {peer}: readable");
 
-                        match read(stream) {
+                        match read(stream, &mut read_buf) {
                             ReadResult::WouldBlock => {}
 
                             ReadResult::Message(message) => {
@@ -420,6 +422,15 @@ fn run<C: Connector + Sync + Send + 'static>(
                 }
             }
         }
+
+        let now = std::time::Instant::now();
+        if now - last_resize > std::time::Duration::from_secs(60) {
+            for (_, stream) in &mut streams {
+                stream.resize_buffers();
+            }
+
+            last_resize = now;
+        }
     }
 }
 
@@ -498,9 +509,9 @@ enum ReadResult {
 }
 
 /// Causes a stream to read into its internal buffer.
-fn read(stream: &mut MessageStream<TcpStream>) -> ReadResult {
+fn read(stream: &mut MessageStream<TcpStream>, read_buf: &mut [u8]) -> ReadResult {
     loop {
-        match stream.read() {
+        match stream.read(read_buf) {
             Ok(0) => break ReadResult::Closed,
 
             Ok(_) => match stream.receive_message() {

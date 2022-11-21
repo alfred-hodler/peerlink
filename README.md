@@ -1,5 +1,9 @@
 # Peerlink
 
+[![Documentation](https://img.shields.io/docsrs/peerlink)](https://docs.rs/peerlink/latest/peerlink/)
+[![Crates.io](https://img.shields.io/crates/v/peerlink.svg)](https://crates.io/crates/peerlink)
+[![License](https://img.shields.io/crates/l/peerlink.svg)](https://github.com/alfred-hodler/peerlink/blob/master/LICENSE)
+
 **What is Peerlink?** Peerlink is a low-level network client for the Bitcoin P2P network written in Rust. It uses a nonblocking reactor to accept inbound connections, make outbound connections, perform message streaming and reassembly, track peers and perform other low-level network operations.
 
 **What is it not?** It is not a node. It contains no state machine whatsoever except for the networking reactor. While it is capable of handling an almost unlimited number of connections, it does not automatically perform handshakes or pingpongs. It is entirely up to the consumer of the API to make sure that required messages are being sent out and that incoming messages are handled in a desired manner.
