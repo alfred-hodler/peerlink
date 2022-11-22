@@ -1,6 +1,6 @@
 /// Unique peer identifier. The user should assume these can be reused by different peers as
 /// peers come and go, i.e. they are not assigned just once for the lifetime of the process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PeerId(pub usize);
 
 impl PeerId {
@@ -24,11 +24,5 @@ impl From<PeerId> for mio::Token {
 impl std::fmt::Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("{}", self.0))
-    }
-}
-
-impl std::hash::Hash for PeerId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
     }
 }

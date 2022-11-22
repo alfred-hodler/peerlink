@@ -146,17 +146,6 @@ pub enum DecodeError {
     ExceedsSizeLimit,
 }
 
-impl DecodeError {
-    /// Determines if the error is the result of a peer violating the protocol.
-    pub fn is_codec_violation(&self) -> bool {
-        use DecodeError::*;
-        match self {
-            MalformedMessage | ExceedsSizeLimit => true,
-            NotEnoughData => false,
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use bitcoin::consensus::Encodable;

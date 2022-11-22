@@ -7,7 +7,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use slab::Slab;
 
-use crate::message_stream::{self, MessageStream};
+use crate::message_stream::{self, DecodeError, MessageStream};
 use crate::PeerId;
 
 /// Token used for waking the reactor event loop.
@@ -227,7 +227,7 @@ fn run<C: Connector + Sync + Send + 'static>(
         poll.poll(&mut events, None)?;
         let has_slot = has_slot(listeners.len(), streams.vacant_key());
 
-        for event in &events {
+        'stream: for event in &events {
             match (event.token(), streams.get_mut(event.token().into())) {
                 (WAKE_TOKEN, None) => {
                     log::trace!("waker event");
@@ -262,6 +262,8 @@ fn run<C: Connector + Sync + Send + 'static>(
                             Command::Disconnect(peer) => match streams.try_remove(peer.value()) {
                                 Some(mut stream) => {
                                     poll.registry().deregister(stream.inner_mut())?;
+
+                                    let _ = write(&mut stream);
                                     let _ = stream.inner_mut().shutdown(std::net::Shutdown::Both);
 
                                     log::info!("peer {peer}: disconnected");
@@ -297,6 +299,7 @@ fn run<C: Connector + Sync + Send + 'static>(
 
                             Command::Shutdown => {
                                 for (id, mut stream) in streams {
+                                    let _ = write(&mut stream);
                                     let r = stream.inner_mut().shutdown(std::net::Shutdown::Both);
                                     log::debug!("shut down stream {}: {:?}", id, r);
                                 }
@@ -336,53 +339,67 @@ fn run<C: Connector + Sync + Send + 'static>(
                     if event.is_readable() {
                         log::trace!("peer {peer}: readable");
 
-                        match read(stream, &mut read_buf) {
-                            ReadResult::WouldBlock => {}
+                        'read: loop {
+                            let read_result = stream.read(&mut read_buf);
 
-                            ReadResult::Message(message) => {
-                                log::debug!("peer {peer}: message: {}", message.cmd());
+                            'decode: loop {
+                                match stream.receive_message() {
+                                    Ok(message) => {
+                                        log::debug!("peer {peer}: rx message: {}", message.cmd());
 
-                                let interests = choose_interest(stream);
-                                poll.registry()
-                                    .reregister(stream.inner_mut(), token, interests)?;
+                                        let _ = sender.send(Event::Message { peer, message });
+                                    }
 
-                                let _ = sender.send(Event::Message { peer, message });
+                                    Err(
+                                        DecodeError::ExceedsSizeLimit
+                                        | DecodeError::MalformedMessage,
+                                    ) => {
+                                        log::info!("peer {peer}: codec violation");
+
+                                        remove_stream(poll.registry(), &mut streams, peer)?;
+
+                                        let _ = sender.send(Event::Disconnected {
+                                            peer,
+                                            reason: DisconnectReason::BadPeer,
+                                        });
+
+                                        break 'stream;
+                                    }
+
+                                    Err(DecodeError::NotEnoughData) => break 'decode,
+                                }
                             }
 
-                            ReadResult::Closed => {
-                                log::debug!("peer {peer}: peer left");
+                            match read_result {
+                                Ok(0) => {
+                                    log::debug!("peer {peer}: peer left");
 
-                                remove_stream(poll.registry(), &mut streams, peer)?;
+                                    remove_stream(poll.registry(), &mut streams, peer)?;
 
-                                let _ = sender.send(Event::Disconnected {
-                                    peer,
-                                    reason: DisconnectReason::Left,
-                                });
-                                continue;
-                            }
+                                    let _ = sender.send(Event::Disconnected {
+                                        peer,
+                                        reason: DisconnectReason::Left,
+                                    });
 
-                            ReadResult::CodecViolation => {
-                                log::info!("peer {peer}: codec violation");
+                                    break 'stream;
+                                }
 
-                                remove_stream(poll.registry(), &mut streams, peer)?;
+                                Ok(_) => continue 'read,
 
-                                let _ = sender.send(Event::Disconnected {
-                                    peer,
-                                    reason: DisconnectReason::BadPeer,
-                                });
-                                continue;
-                            }
+                                Err(err) if would_block(&err) => break 'read,
 
-                            ReadResult::IoError(err) => {
-                                log::warn!("peer {peer}: IO error: {err}");
+                                Err(err) => {
+                                    log::warn!("peer {peer}: IO error: {err}");
 
-                                remove_stream(poll.registry(), &mut streams, peer)?;
+                                    remove_stream(poll.registry(), &mut streams, peer)?;
 
-                                let _ = sender.send(Event::Disconnected {
-                                    peer,
-                                    reason: DisconnectReason::Error(err),
-                                });
-                                continue;
+                                    let _ = sender.send(Event::Disconnected {
+                                        peer,
+                                        reason: DisconnectReason::Error(err),
+                                    });
+
+                                    break 'stream;
+                                }
                             }
                         }
                     }
@@ -494,44 +511,6 @@ impl Connector for Socks5Connector {
                 }
 
                 Err(err) => break Err(err),
-            }
-        }
-    }
-}
-
-/// Covers the outcomes of reading from a stream.
-enum ReadResult {
-    WouldBlock,
-    Message(RawNetworkMessage),
-    Closed,
-    CodecViolation,
-    IoError(io::Error),
-}
-
-/// Causes a stream to read into its internal buffer.
-fn read(stream: &mut MessageStream<TcpStream>, read_buf: &mut [u8]) -> ReadResult {
-    loop {
-        match stream.read(read_buf) {
-            Ok(0) => break ReadResult::Closed,
-
-            Ok(_) => match stream.receive_message() {
-                Ok(msg) => break ReadResult::Message(msg),
-
-                Err(err) => {
-                    if err.is_codec_violation() {
-                        break ReadResult::CodecViolation;
-                    } else {
-                        continue;
-                    }
-                }
-            },
-
-            Err(err) if would_block(&err) => {
-                break ReadResult::WouldBlock;
-            }
-
-            Err(err) => {
-                break ReadResult::IoError(err);
             }
         }
     }
