@@ -2,9 +2,9 @@
 //! networking logic and allow the consumer to focus on communicating with other peers on the
 //! network. Message streaming, buffering and basic peer management is handled by the library.
 //!
-//! The way to utilize this crate is to create a `Reactor` instance, acquire its messaging handle
+//! The way to use this crate is to create a `Reactor` instance, acquire its messaging handle
 //! and let the reactor run on its own thread. The API consumer then communicates with the reactor
-//! using a `Handle`, which can be cloned and used from different threads.
+//! using a `Handle` instance.
 //!
 //! The following example covers connecting to a Bitcoin node running on localhost, sending
 //! a message and then shutting down the reactor.

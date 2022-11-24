@@ -138,7 +138,6 @@ impl<C: Connector + Sync + Send + 'static> Reactor<C> {
 }
 
 /// Used for bidirectional communication with a reactor.
-#[derive(Clone)]
 pub struct Handle {
     waker: Arc<Waker>,
     sender: crossbeam_channel::Sender<Command>,
@@ -317,14 +316,17 @@ fn run<C: Connector + Sync + Send + 'static>(
                     let listener_token = usize::MAX - 1 - token.0;
                     log::trace!("listener {}", token.0);
 
-                    match listeners[listener_token].accept() {
-                        Ok((stream, addr)) => {
-                            let peer = add_stream(poll.registry(), &mut streams, stream)?;
-                            log::info!("peer {peer}: accepted connection from {addr}");
+                    loop {
+                        match listeners[listener_token].accept() {
+                            Ok((stream, addr)) => {
+                                let peer = add_stream(poll.registry(), &mut streams, stream)?;
+                                log::info!("peer {peer}: accepted connection from {addr}");
 
-                            let _ = sender.send(Event::ConnectedFrom { peer, addr });
+                                let _ = sender.send(Event::ConnectedFrom { peer, addr });
+                            }
+                            Err(err) if would_block(&err) => break,
+                            Err(err) => log::warn!("accept error: {}", err),
                         }
-                        Err(err) => log::warn!("accept error: {}", err),
                     }
                 }
 
