@@ -38,6 +38,8 @@ fn server_abrupt_leave() {
 }
 
 fn shutdown_test(port: u16, shutdown_command: Command, client_is_leaving: bool) {
+    let _ = env_logger::builder().is_test(true).try_init();
+
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
 
     let (server_reactor, server_handle) = Reactor::new(vec![server_addr]).unwrap();

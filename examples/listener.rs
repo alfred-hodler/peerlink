@@ -20,7 +20,7 @@ fn main() -> std::io::Result<()> {
 
     loop {
         match handle.receive()? {
-            Event::ConnectedFrom { peer, addr } => {
+            Event::ConnectedFrom { peer, addr, .. } => {
                 println!("Peer {peer} connected from {addr}");
                 peers.insert(peer);
             }

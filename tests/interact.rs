@@ -2,9 +2,10 @@ use core::panic;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::thread::JoinHandle;
 
+use bitcoin::consensus::Decodable;
 use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
 use peerlink::reactor::{DisconnectReason, Handle};
-use peerlink::{Command, PeerId, Reactor};
+use peerlink::{Command, Event, PeerId, Reactor};
 
 /// Starts one client and one server and performs ping-pongs between them in an interleaved manner.
 #[test]
@@ -178,6 +179,43 @@ fn many_to_one_bulk() {
 
     for c in &clients {
         assert!(c.try_receive().is_none());
+    }
+}
+
+#[test]
+fn very_large() {
+    let Scaffold {
+        server,
+        client,
+        server_addr,
+        ..
+    } = start_server_client(8105);
+
+    let (client_peer, _) = connect(&client, &server, server_addr);
+
+    let raw_block = include_bytes!("block_540107").to_vec();
+    let block = bitcoin::Block::consensus_decode(&mut raw_block.as_slice()).unwrap();
+
+    client
+        .send(Command::Message(
+            client_peer,
+            RawNetworkMessage {
+                magic: 0,
+                payload: NetworkMessage::Block(block.clone()),
+            },
+        ))
+        .unwrap();
+
+    match server.receive().unwrap() {
+        Event::Message {
+            message:
+                RawNetworkMessage {
+                    payload: NetworkMessage::Block(rx_block),
+                    ..
+                },
+            ..
+        } if block == rx_block => {}
+        _ => panic!(),
     }
 }
 

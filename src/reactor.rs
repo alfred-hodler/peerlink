@@ -35,15 +35,26 @@ pub enum Event {
     /// The reactor attempted to connect to a remote peer.
     ConnectedTo(io::Result<(PeerId, SocketAddr)>),
     /// The reactor received a connection from a remote peer.
-    ConnectedFrom { peer: PeerId, addr: SocketAddr },
+    ConnectedFrom {
+        /// The peer associated with the event.
+        peer: PeerId,
+        /// The address of the remote peer.
+        addr: SocketAddr,
+        /// The address of the local interface that accepted the connection.
+        interface: SocketAddr,
+    },
     /// A peer disconnected.
     Disconnected {
+        /// The peer associated with the event.
         peer: PeerId,
+        /// The reason the peer left.
         reason: DisconnectReason,
     },
     /// A peer produced a message.
     Message {
+        /// The peer associated with the event.
         peer: PeerId,
+        /// The message received from the peer.
         message: RawNetworkMessage,
     },
     /// No peer exists with the specified id. Sent when an operation was specified using a peer id
@@ -313,16 +324,21 @@ fn run<C: Connector + Sync + Send + 'static>(
                 }
 
                 (token, None) if is_listener(listeners.len(), token) && has_slot => {
-                    let listener_token = usize::MAX - 1 - token.0;
-                    log::trace!("listener {}", token.0);
+                    let listener = usize::MAX - 1 - token.0;
+                    let interface = listeners[listener].local_addr()?;
+                    log::trace!("listener {} (interface {interface})", token.0);
 
                     loop {
-                        match listeners[listener_token].accept() {
+                        match listeners[listener].accept() {
                             Ok((stream, addr)) => {
                                 let peer = add_stream(poll.registry(), &mut streams, stream)?;
                                 log::info!("peer {peer}: accepted connection from {addr}");
 
-                                let _ = sender.send(Event::ConnectedFrom { peer, addr });
+                                let _ = sender.send(Event::ConnectedFrom {
+                                    peer,
+                                    addr,
+                                    interface,
+                                });
                             }
                             Err(err) if would_block(&err) => break,
                             Err(err) => log::warn!("accept error: {}", err),
