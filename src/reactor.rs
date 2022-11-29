@@ -111,13 +111,13 @@ impl Reactor<Socks5Connector> {
     ///
     /// Only available under the `socks` feature.
     pub fn with_proxy(
-        bind_addr: Vec<SocketAddr>,
+        config: Config,
         proxy: SocketAddr,
         username: Option<String>,
         password: Option<String>,
     ) -> io::Result<(Self, Handle)> {
         Self::with_connector(
-            bind_addr,
+            config,
             Socks5Connector {
                 proxy,
                 username,
@@ -209,6 +209,11 @@ impl Handle {
                 "channel disconnected",
             ))),
         }
+    }
+
+    /// Returns the number of messages in the receive channel.
+    pub fn receive_queue_size(&self) -> usize {
+        self.receiver.len()
     }
 }
 

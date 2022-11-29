@@ -1,3 +1,5 @@
+//! # Peerlink
+//!
 //! Peerlink is a low-level network client for Bitcoin. It is designed to abstract away and hide
 //! networking logic and allow the consumer to focus on communicating with other peers on the
 //! network. Message streaming, buffering and basic peer management is handled by the library.
@@ -6,6 +8,15 @@
 //! and let the reactor run on its own thread. The API consumer then communicates with the reactor
 //! using a `Handle` instance.
 //!
+//! # User Agent Handling
+//!
+//! While Peerlink does not enforce any particular user agent string format when sending out
+//! `version` messages, please use the `user_agent` function in the crate root to create a well
+//! formatted BIP0014 UA string. Doing so ensures that Peerlink is identifying itself properly to
+//! the network.
+//!
+//! # Example
+//!
 //! The following example covers connecting to a Bitcoin node running on localhost, sending
 //! a message and then shutting down the reactor.
 //!
@@ -13,7 +24,8 @@
 //! # use bitcoin::network::message::RawNetworkMessage;
 //! # fn main() -> std::io::Result<()> {
 //! let config = peerlink::Config {
-//!     bind_addr: vec![], // empty vec means we aren't listening for inbound connections
+//!     // empty vec means we aren't listening for inbound connections
+//!     bind_addr: vec![],
 //!     ..Default::default()
 //! };
 //!
@@ -38,7 +50,7 @@
 //! handle.send(peerlink::Command::Message(peer, RawNetworkMessage {magic: todo!(), payload: todo!()}))?;
 //!
 //! // When done, shut down the reactor and join with its thread
-//! handle.send(peerlink::Command::Shutdown)?;
+//! handle.send(peerlink::Command::Shutdown)?;  
 //! let _ = reactor_join_handle.join();
 //!
 //! # Ok(())
@@ -63,4 +75,26 @@ pub struct Config {
     /// Configuration parameters for individual peer connections. This allows the fine tuning of
     /// internal buffer sizes etc. Most consumers won't have to modify this.
     pub stream_config: StreamConfig,
+}
+
+/// Creates a well formed BIP0014 user agent string that should be used with `version` messages.
+/// For instance, if `app_name` is `supernode` and `app_version` is `0.6.5` and the version of
+/// Peerlink being used is `0.4.0`, the resulting string will be `/peerlink:0.4.0/supernode:0.6.5/`.
+pub fn user_agent(app_name: &str, app_version: &str) -> String {
+    format!(
+        "/peerlink:{}/{app_name}:{app_version}/",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn ua_format() {
+        let ua = super::user_agent("supernode", "0.6.5");
+        assert_eq!(
+            ua,
+            format!("/peerlink:{}/supernode:0.6.5/", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }
