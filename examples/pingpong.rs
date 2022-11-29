@@ -3,7 +3,7 @@ use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::network::message_network::VersionMessage;
 use bitcoin::Network;
 use peerlink::reactor::Event;
-use peerlink::Reactor;
+use peerlink::{Config, Reactor};
 
 /// This example connects to a peer, performs a handshake and does a ping-pong. The user must
 /// provide a peer socket address as the first parameter.
@@ -34,7 +34,7 @@ fn main() -> std::io::Result<()> {
     };
 
     // Create the reactor and get its handle.
-    let (reactor, handle) = Reactor::new(vec![])?;
+    let (reactor, handle) = Reactor::new(Config::default())?;
     let _join_handle = reactor.run();
 
     // Connect to our peer.

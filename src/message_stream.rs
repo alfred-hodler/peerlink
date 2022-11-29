@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::time::Instant;
 
 use bitcoin::consensus::{encode, Encodable};
 use bitcoin::network::message::{self, RawNetworkMessage};
@@ -7,9 +8,29 @@ const MSG_LEN_OFFSET: usize = 16;
 
 const MSG_PAYLOAD_OFFSET: usize = 24;
 
-const MIN_RX_BUF_SIZE: usize = 128 * 1024;
+/// Stream related configuration parameters.
+#[derive(Debug, Clone)]
+pub struct StreamConfig {
+    /// Defines the minimum size of the buffer used for message reassembly. Low values will cause
+    /// more frequent reallocation while high values will reallocate less at the expense of more
+    /// memory usage.
+    pub rx_buf_min_size: usize,
+    /// Defines the lower and upper size bounds for the send buffer. Once the send buffer is full,
+    /// it is not possible to queue new messages for sending until some capacity is available.
+    pub tx_buf_limits: std::ops::Range<usize>,
+    /// The duration after which a peer is disconnected if it fails to read incoming data.
+    pub stream_write_timeout: std::time::Duration,
+}
 
-const MIN_TX_BUF_SIZE: usize = 128 * 1024;
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            rx_buf_min_size: 128 * 1024,
+            tx_buf_limits: (128 * 1024)..message::MAX_MSG_SIZE,
+            stream_write_timeout: std::time::Duration::from_secs(30),
+        }
+    }
+}
 
 /// This trait allows callers to check if the item is in a usable state (connectedness etc).
 /// Useful with streams that do not guarantee to be immediately usable.
@@ -22,6 +43,8 @@ pub trait MaybeReady {
 /// on the read side and message serialization and flushing on the write side.
 #[derive(Debug)]
 pub struct MessageStream<T: Read + Write> {
+    /// Configuration parameters for the stream.
+    config: StreamConfig,
     /// The read+write stream underlying the connection.
     stream: T,
     /// Buffer used for message reconstruction.
@@ -30,15 +53,19 @@ pub struct MessageStream<T: Read + Write> {
     tx_msg_buf: Vec<u8>,
     /// Cached readyness.
     ready: bool,
+    /// Last successful write time.
+    last_write: Instant,
 }
 
 impl<T: Read + Write + MaybeReady> MessageStream<T> {
-    pub fn new(stream: T) -> Self {
+    pub fn new(stream: T, config: StreamConfig) -> Self {
         Self {
             stream,
-            rx_msg_buf: Vec::with_capacity(MIN_RX_BUF_SIZE),
-            tx_msg_buf: Vec::with_capacity(MIN_TX_BUF_SIZE),
+            rx_msg_buf: Vec::with_capacity(config.rx_buf_min_size),
+            tx_msg_buf: Vec::with_capacity(config.tx_buf_limits.end),
             ready: false,
+            last_write: Instant::now(),
+            config,
         }
     }
 
@@ -86,19 +113,34 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
 
     /// Takes some bytes from the local send buffer and sends them. Removes successfully sent bytes
     /// from the buffer. Returns the number of bytes sent.
-    pub fn write(&mut self) -> io::Result<usize> {
+    pub fn write(&mut self, now: Instant) -> io::Result<usize> {
         let written = self.stream.write(&self.tx_msg_buf)?;
         self.tx_msg_buf.drain(..written);
         self.stream.flush()?;
+        self.last_write = now;
         Ok(written)
     }
 
-    /// Sends a message. In reality this method simply serializes the message and places it into
+    /// Queues a message for sending. This method simply serializes the message and places it into
     /// the internal buffer. `write` must be called when the socket is writeable in order to flush.
-    pub fn send_message(&mut self, message: &RawNetworkMessage) {
-        message
-            .consensus_encode(&mut self.tx_msg_buf)
-            .expect("writing to Vec cannot fail");
+    ///
+    /// Returns `true` if the write buffer contains enough space to accept the message, or `false`
+    /// if the buffer is full and the message cannot be queued at this time.
+    ///
+    /// Note: this will fail only if the buffer is full prior to even attempting to queue. A buffer
+    /// that is close to full will not reject a message, even if queueing might exceed the
+    /// configured limits.
+    #[must_use]
+    pub fn queue_message(&mut self, message: &RawNetworkMessage) -> bool {
+        if self.tx_msg_buf.len() <= self.config.tx_buf_limits.end {
+            message
+                .consensus_encode(&mut self.tx_msg_buf)
+                .expect("writing to Vec cannot fail");
+
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns a mutable reference to the underlying stream.
@@ -110,6 +152,12 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
     #[inline(always)]
     pub fn has_queued_data(&self) -> bool {
         !self.tx_msg_buf.is_empty()
+    }
+
+    /// Returns whether the stream is stale on the write side, i.e. the data is not leaving the
+    /// send buffer in a timely manner.
+    pub fn is_write_stale(&self, now: Instant) -> bool {
+        self.has_queued_data() && (now - self.last_write) >= self.config.stream_write_timeout
     }
 
     /// Returns `true` if the underlying stream is ready. Otherwise it tests readyness and
@@ -128,9 +176,9 @@ impl<T: Read + Write + MaybeReady> MessageStream<T> {
     /// eventually exhaust available memory on less powerful devices when managing many peers.
     pub fn resize_buffers(&mut self) {
         self.rx_msg_buf
-            .truncate(MIN_RX_BUF_SIZE.max(self.rx_msg_buf.len()));
+            .truncate(self.config.rx_buf_min_size.max(self.rx_msg_buf.len()));
         self.tx_msg_buf
-            .truncate(MIN_TX_BUF_SIZE.max(self.tx_msg_buf.len()));
+            .truncate(self.config.tx_buf_limits.start.max(self.tx_msg_buf.len()));
     }
 }
 
@@ -177,7 +225,7 @@ mod test {
         ping_msg(1).consensus_encode(&mut cursor).unwrap();
         cursor.set_position(0);
 
-        let mut conn = MessageStream::new(&mut cursor);
+        let mut conn = MessageStream::new(&mut cursor, StreamConfig::default());
         let read = conn.read(&mut buf).unwrap();
 
         assert_eq!(read, 64);
@@ -192,7 +240,7 @@ mod test {
     fn reassemble_message_partial_reads() {
         let mut buf = [0; 1024];
         let mut cursor = Cursor::new(Vec::<u8>::new());
-        let mut conn = MessageStream::new(&mut cursor);
+        let mut conn = MessageStream::new(&mut cursor, StreamConfig::default());
         let serialized = encode::serialize(&ping_msg(0));
 
         let pos = conn.stream.position();
@@ -222,7 +270,7 @@ mod test {
         msg[16..20].copy_from_slice(&[255, 255, 255, 255]);
 
         let mut cursor = Cursor::new(msg);
-        let mut conn = MessageStream::new(&mut cursor);
+        let mut conn = MessageStream::new(&mut cursor, StreamConfig::default());
         let read = conn.read(&mut buf).unwrap();
         assert_eq!(read, 32);
         assert_eq!(conn.receive_message(), Err(DecodeError::ExceedsSizeLimit));
@@ -231,17 +279,37 @@ mod test {
     #[test]
     fn send_message() {
         let mut wire = Cursor::new(Vec::<u8>::new());
-        let mut connection = MessageStream::new(&mut wire);
+        let mut connection = MessageStream::new(&mut wire, StreamConfig::default());
 
-        connection.send_message(&ping_msg(0));
-        connection.send_message(&ping_msg(1));
-        connection.send_message(&ping_msg(2));
+        assert!(connection.queue_message(&ping_msg(0)));
+        assert!(connection.queue_message(&ping_msg(1)));
+        assert!(connection.queue_message(&ping_msg(2)));
 
         let buffer_len = connection.tx_msg_buf.len();
         let cloned_buffer = connection.tx_msg_buf.clone();
-        let written = connection.write().unwrap();
+        let written = connection.write(Instant::now()).unwrap();
         assert_eq!(written, buffer_len);
         assert_eq!(wire.position(), 96);
+        assert_eq!(wire.into_inner(), cloned_buffer);
+    }
+
+    #[test]
+    fn send_message_buf_full() {
+        let mut wire = Cursor::new(Vec::<u8>::new());
+        let config = StreamConfig {
+            tx_buf_limits: 1..16,
+            ..Default::default()
+        };
+        let mut connection = MessageStream::new(&mut wire, config);
+
+        assert!(connection.queue_message(&ping_msg(0)));
+        assert!(!connection.queue_message(&ping_msg(1)));
+
+        let buffer_len = connection.tx_msg_buf.len();
+        let cloned_buffer = connection.tx_msg_buf.clone();
+        let written = connection.write(Instant::now()).unwrap();
+        assert_eq!(written, buffer_len);
+        assert_eq!(wire.position(), 32);
         assert_eq!(wire.into_inner(), cloned_buffer);
     }
 }

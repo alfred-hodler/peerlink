@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use peerlink::reactor::DisconnectReason;
-use peerlink::{Command, Event, PeerId, Reactor};
+use peerlink::{Command, Config, Event, PeerId, Reactor};
 
 // These tests are designed to perform client and server disconnects in a variety of manners:
 // orderly, disorderly, and abrupt. In each instance, the remaining party must notice the
@@ -42,8 +42,13 @@ fn shutdown_test(port: u16, shutdown_command: Command, client_is_leaving: bool) 
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
 
-    let (server_reactor, server_handle) = Reactor::new(vec![server_addr]).unwrap();
-    let (client_reactor, client_handle) = Reactor::new(vec![]).unwrap();
+    let config = Config {
+        bind_addr: vec![server_addr],
+        ..Default::default()
+    };
+
+    let (server_reactor, server_handle) = Reactor::new(config).unwrap();
+    let (client_reactor, client_handle) = Reactor::new(Config::default()).unwrap();
 
     let _ = server_reactor.run();
     let _ = client_reactor.run();

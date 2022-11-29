@@ -12,8 +12,12 @@
 //! ```no_run
 //! # use bitcoin::network::message::RawNetworkMessage;
 //! # fn main() -> std::io::Result<()> {
-//! // passing an empty vector means we aren't listening for connections on any interfaces
-//! let (reactor, handle) = peerlink::Reactor::new(vec![])?;
+//! let config = peerlink::Config {
+//!     bind_addr: vec![], // empty vec means we aren't listening for inbound connections
+//!     ..Default::default()
+//! };
+//!
+//! let (reactor, handle) = peerlink::Reactor::new(config)?;
 //!
 //! // start the reactor (spawns its own thread)
 //! let reactor_join_handle = reactor.run();
@@ -46,6 +50,17 @@ mod peer;
 pub mod reactor;
 
 pub use bitcoin;
+pub use message_stream::StreamConfig;
 pub use mio::net::TcpStream;
 pub use peer::PeerId;
 pub use reactor::{Command, Connector, Event, Reactor};
+
+/// Configuration parameters for the reactor.
+#[derive(Debug, Default)]
+pub struct Config {
+    /// The list of socket addresses where the reactor listens for inbound connections.
+    pub bind_addr: Vec<std::net::SocketAddr>,
+    /// Configuration parameters for individual peer connections. This allows the fine tuning of
+    /// internal buffer sizes etc. Most consumers won't have to modify this.
+    pub stream_config: StreamConfig,
+}

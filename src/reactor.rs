@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bitcoin::network::message::RawNetworkMessage;
 use mio::net::{TcpListener, TcpStream};
@@ -8,7 +9,7 @@ use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use slab::Slab;
 
 use crate::message_stream::{self, DecodeError, MessageStream};
-use crate::PeerId;
+use crate::{Config, PeerId};
 
 /// Token used for waking the reactor event loop.
 const WAKE_TOKEN: Token = Token(usize::MAX);
@@ -60,6 +61,14 @@ pub enum Event {
     /// No peer exists with the specified id. Sent when an operation was specified using a peer id
     /// that is not present in the reactor.
     NoPeer(PeerId),
+    /// The send buffer associated with the peer is full. It means the peer is probably not
+    /// reading data from the wire in a timely manner.
+    SendBufferFull {
+        /// The peer associated with the event.
+        peer: PeerId,
+        /// The message that could not be sent to the peer.
+        message: RawNetworkMessage,
+    },
 }
 
 /// Explains why a client connection was disconnected.
@@ -71,6 +80,8 @@ pub enum DisconnectReason {
     Left,
     /// The peer violated the protocol in some way.
     BadPeer,
+    /// The write side is stale, i.e. the peer is not reading the data we are sending.
+    WriteStale,
     /// An IO error occurred.
     Error(io::Error),
 }
@@ -79,7 +90,7 @@ pub enum DisconnectReason {
 /// caller using a handle.
 pub struct Reactor<C: Connector + Sync + Send + 'static> {
     poll: Poll,
-    bind_addr: Vec<SocketAddr>,
+    config: crate::Config,
     sender: crossbeam_channel::Sender<Event>,
     receiver: crossbeam_channel::Receiver<Command>,
     connector: C,
@@ -88,8 +99,8 @@ pub struct Reactor<C: Connector + Sync + Send + 'static> {
 
 impl Reactor<DefaultConnector> {
     /// Creates a new reactor with the default connector.
-    pub fn new(bind_addr: Vec<SocketAddr>) -> io::Result<(Self, Handle)> {
-        Self::with_connector(bind_addr, DefaultConnector)
+    pub fn new(config: Config) -> io::Result<(Self, Handle)> {
+        Self::with_connector(config, DefaultConnector)
     }
 }
 
@@ -118,7 +129,7 @@ impl Reactor<Socks5Connector> {
 
 impl<C: Connector + Sync + Send + 'static> Reactor<C> {
     /// Creates a new reactor with a custom connector.
-    pub fn with_connector(bind_addr: Vec<SocketAddr>, connector: C) -> io::Result<(Self, Handle)> {
+    pub fn with_connector(config: Config, connector: C) -> io::Result<(Self, Handle)> {
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
         let (cmd_sender, cmd_receiver) = crossbeam_channel::unbounded();
@@ -132,7 +143,7 @@ impl<C: Connector + Sync + Send + 'static> Reactor<C> {
 
         let reactor = Self {
             poll,
-            bind_addr,
+            config,
             sender: event_sender,
             receiver: cmd_receiver,
             connector,
@@ -189,7 +200,7 @@ impl Handle {
 
     // Attempts to receive a message from the reactor associated with this handle with a timeout.
     /// If an IO error is produced, it means the reactor is irrecoverable and should be discarded.
-    pub fn receive_timeout(&self, duration: std::time::Duration) -> Option<io::Result<Event>> {
+    pub fn receive_timeout(&self, duration: Duration) -> Option<io::Result<Event>> {
         match self.receiver.recv_timeout(duration) {
             Ok(event) => Some(Ok(event)),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
@@ -205,14 +216,15 @@ impl Handle {
 fn run<C: Connector + Sync + Send + 'static>(
     Reactor {
         mut poll,
-        bind_addr,
+        config,
         sender,
         receiver,
         mut connector,
         _waker,
     }: Reactor<C>,
 ) -> io::Result<()> {
-    let listeners: Vec<_> = bind_addr
+    let listeners: Vec<_> = config
+        .bind_addr
         .into_iter()
         .enumerate()
         .map(|(offset, addr)| {
@@ -231,11 +243,13 @@ fn run<C: Connector + Sync + Send + 'static>(
     let mut streams: Slab<MessageStream<TcpStream>> = Slab::with_capacity(16);
     let mut events = Events::with_capacity(1024);
     let mut read_buf = [0; 1024 * 1024];
-    let mut last_resize = std::time::Instant::now();
+    let mut last_maintenance = Instant::now();
 
     loop {
-        poll.poll(&mut events, None)?;
+        poll.poll(&mut events, Some(Duration::from_secs(5)))?;
+
         let has_slot = has_slot(listeners.len(), streams.vacant_key());
+        let now = Instant::now();
 
         'stream: for event in &events {
             match (event.token(), streams.get_mut(event.token().into())) {
@@ -250,8 +264,12 @@ fn run<C: Connector + Sync + Send + 'static>(
                                 let result = if has_slot {
                                     match connector.connect(addr) {
                                         Ok(stream) => {
-                                            let peer =
-                                                add_stream(poll.registry(), &mut streams, stream)?;
+                                            let peer = add_stream(
+                                                poll.registry(),
+                                                &mut streams,
+                                                stream,
+                                                config.stream_config.clone(),
+                                            )?;
 
                                             log::info!("connected to peer {peer} at {addr}");
 
@@ -273,7 +291,7 @@ fn run<C: Connector + Sync + Send + 'static>(
                                 Some(mut stream) => {
                                     poll.registry().deregister(stream.inner_mut())?;
 
-                                    let _ = write(&mut stream);
+                                    let _ = write(&mut stream, now);
                                     let _ = stream.inner_mut().shutdown(std::net::Shutdown::Both);
 
                                     log::info!("peer {peer}: disconnected");
@@ -292,14 +310,19 @@ fn run<C: Connector + Sync + Send + 'static>(
                             Command::Message(peer, message) => {
                                 match streams.get_mut(peer.value()) {
                                     Some(stream) => {
-                                        stream.send_message(&message);
-
-                                        poll.registry().reregister(
-                                            stream.inner_mut(),
-                                            peer.into(),
-                                            Interest::READABLE | Interest::WRITABLE,
-                                        )?;
+                                        if stream.queue_message(&message) {
+                                            poll.registry().reregister(
+                                                stream.inner_mut(),
+                                                peer.into(),
+                                                Interest::READABLE | Interest::WRITABLE,
+                                            )?;
+                                        } else {
+                                            let _ = sender
+                                                .send(Event::SendBufferFull { peer, message });
+                                            log::warn!("send buffer for peer {peer} is full");
+                                        }
                                     }
+
                                     None => {
                                         let _ = sender.send(Event::NoPeer(peer));
                                         log::warn!("message: peer {} not found", peer.value());
@@ -309,7 +332,7 @@ fn run<C: Connector + Sync + Send + 'static>(
 
                             Command::Shutdown => {
                                 for (id, mut stream) in streams {
-                                    let _ = write(&mut stream);
+                                    let _ = write(&mut stream, now);
                                     let r = stream.inner_mut().shutdown(std::net::Shutdown::Both);
                                     log::debug!("shut down stream {}: {:?}", id, r);
                                 }
@@ -331,7 +354,12 @@ fn run<C: Connector + Sync + Send + 'static>(
                     loop {
                         match listeners[listener].accept() {
                             Ok((stream, addr)) => {
-                                let peer = add_stream(poll.registry(), &mut streams, stream)?;
+                                let peer = add_stream(
+                                    poll.registry(),
+                                    &mut streams,
+                                    stream,
+                                    config.stream_config.clone(),
+                                )?;
                                 log::info!("peer {peer}: accepted connection from {addr}");
 
                                 let _ = sender.send(Event::ConnectedFrom {
@@ -425,7 +453,7 @@ fn run<C: Connector + Sync + Send + 'static>(
                     if event.is_writable() {
                         log::trace!("peer {peer}: writable");
 
-                        match write(stream) {
+                        match write(stream, now) {
                             Ok(()) => {
                                 let interests = choose_interest(stream);
                                 poll.registry()
@@ -458,13 +486,32 @@ fn run<C: Connector + Sync + Send + 'static>(
             }
         }
 
-        let now = std::time::Instant::now();
-        if now - last_resize > std::time::Duration::from_secs(60) {
+        // stale stream removal
+        streams.retain(|token, stream| {
+            if stream.is_write_stale(now) {
+                let peer = PeerId(token);
+                log::info!("removing stale peer {peer}");
+
+                poll.registry().deregister(stream.inner_mut()).unwrap();
+
+                let _ = sender.send(Event::Disconnected {
+                    peer,
+                    reason: DisconnectReason::WriteStale,
+                });
+
+                false
+            } else {
+                true
+            }
+        });
+
+        // periodic buffer resize
+        if (now - last_maintenance).as_secs() > 30 {
             for (_, stream) in &mut streams {
                 stream.resize_buffers();
             }
 
-            last_resize = now;
+            last_maintenance = now;
         }
     }
 }
@@ -513,8 +560,6 @@ impl Connector for Socks5Connector {
         }
         .into_inner();
 
-        use std::time::Duration;
-
         let try_cycle_duration = Duration::from_millis(1);
         let try_deadline = Duration::from_millis(5);
 
@@ -535,13 +580,13 @@ impl Connector for Socks5Connector {
 }
 
 /// Causes a stream to write into its underlying stream.
-fn write(stream: &mut MessageStream<TcpStream>) -> io::Result<()> {
+fn write(stream: &mut MessageStream<TcpStream>, now: Instant) -> io::Result<()> {
     if !stream.has_queued_data() {
         return Ok(());
     }
 
     loop {
-        match stream.write() {
+        match stream.write(now) {
             Ok(written) => {
                 let has_more = stream.has_queued_data();
                 log::trace!("wrote out {written} bytes, has more: {}", has_more);
@@ -566,11 +611,12 @@ fn add_stream(
     registry: &Registry,
     streams: &mut Slab<MessageStream<TcpStream>>,
     mut stream: TcpStream,
+    stream_cfg: message_stream::StreamConfig,
 ) -> std::io::Result<PeerId> {
     let token = Token(streams.vacant_key());
 
     registry.register(&mut stream, token, Interest::READABLE)?;
-    streams.insert(MessageStream::new(stream));
+    streams.insert(MessageStream::new(stream, stream_cfg));
 
     Ok(token.into())
 }

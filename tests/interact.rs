@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use bitcoin::consensus::Decodable;
 use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
 use peerlink::reactor::{DisconnectReason, Handle};
-use peerlink::{Command, Event, PeerId, Reactor};
+use peerlink::{Command, Config, Event, PeerId, Reactor};
 
 /// Starts one client and one server and performs ping-pongs between them in an interleaved manner.
 #[test]
@@ -94,7 +94,13 @@ fn many_to_one_interleaved() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8103).into();
-    let (server_reactor, server) = Reactor::new(vec![server_addr]).unwrap();
+
+    let server_config = Config {
+        bind_addr: vec![server_addr],
+        ..Default::default()
+    };
+
+    let (server_reactor, server) = Reactor::new(server_config).unwrap();
     server_reactor.run();
 
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -105,7 +111,7 @@ fn many_to_one_interleaved() {
         .into_iter()
         .enumerate()
         .map(|(i, _)| {
-            let (client_reactor, client) = Reactor::new(vec![]).unwrap();
+            let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
             client_reactor.run();
 
             let (client_peer, _) = connect(&client, &server, server_addr);
@@ -135,7 +141,13 @@ fn many_to_one_bulk() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8104).into();
-    let (server_reactor, server) = Reactor::new(vec![server_addr]).unwrap();
+
+    let server_config = Config {
+        bind_addr: vec![server_addr],
+        ..Default::default()
+    };
+
+    let (server_reactor, server) = Reactor::new(server_config).unwrap();
     server_reactor.run();
 
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -147,7 +159,7 @@ fn many_to_one_bulk() {
         .into_iter()
         .enumerate()
         .map(|(i, _)| {
-            let (client_reactor, client) = Reactor::new(vec![]).unwrap();
+            let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
             client_reactor.run();
 
             let (client_peer, _) = connect(&client, &server, server_addr);
@@ -233,8 +245,13 @@ fn start_server_client(server_port: u16) -> Scaffold {
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port).into();
 
-    let (server_reactor, server_handle) = Reactor::new(vec![server_addr]).unwrap();
-    let (client_reactor, client_handle) = Reactor::new(vec![]).unwrap();
+    let server_config = Config {
+        bind_addr: vec![server_addr],
+        ..Default::default()
+    };
+
+    let (server_reactor, server_handle) = Reactor::new(server_config).unwrap();
+    let (client_reactor, client_handle) = Reactor::new(Config::default()).unwrap();
 
     let server_join_handle = server_reactor.run();
     let client_join_handle = client_reactor.run();
