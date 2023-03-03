@@ -1,6 +1,6 @@
 [package]
 name = "peerlink"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["Alfred Hodler <alfred_hodler@protonmail.com>"]
 license = "MIT"
@@ -14,11 +14,11 @@ socks = ["dep:socks"]
 
 [dependencies]
 bitcoin = "0.29.2"
-crossbeam-channel = "0.5.6"
+crossbeam-channel = "0.5.7"
 log = "0.4.17"
-mio = { version = "0.8.5", features = ["net", "os-poll"] }
-slab = "0.4.7"
+mio = { version = "0.8.6", features = ["net", "os-poll"] }
+slab = "0.4.8"
 socks = { version = "0.3.4", optional = true }
 
 [dev-dependencies]
-env_logger = "0.9.3"
+env_logger = "0.10.0"

@@ -39,8 +39,8 @@
 //!
 //! // expect a `ConnectedTo` event if everything went well
 //! let peer = match handle.receive()? {
-//!     peerlink::Event::ConnectedTo(Ok((peer, peer_addr))) => {
-//!         println!("Connected to peer {} at address {}", peer, peer_addr);
+//!     peerlink::Event::ConnectedTo { addr, result: Ok(peer)} => {
+//!         println!("Connected to peer {} at address {}", peer, addr);
 //!         peer
 //!     }
 //!     _ => panic!("not interested in other messages yet"),

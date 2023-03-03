@@ -283,7 +283,9 @@ fn connect(client: &Handle, server: &Handle, server_addr: SocketAddr) -> (PeerId
     };
 
     let server_peer = match client.receive().unwrap() {
-        peerlink::Event::ConnectedTo(Ok((peer, _))) => {
+        peerlink::Event::ConnectedTo {
+            result: Ok(peer), ..
+        } => {
             println!("client: connected to server");
             peer
         }

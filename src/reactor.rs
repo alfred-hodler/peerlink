@@ -34,7 +34,10 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Event {
     /// The reactor attempted to connect to a remote peer.
-    ConnectedTo(io::Result<(PeerId, SocketAddr)>),
+    ConnectedTo {
+        addr: SocketAddr,
+        result: io::Result<PeerId>,
+    },
     /// The reactor received a connection from a remote peer.
     ConnectedFrom {
         /// The peer associated with the event.
@@ -289,7 +292,7 @@ fn run<C: Connector + Sync + Send + 'static>(
                                     ))
                                 };
 
-                                let _ = sender.send(Event::ConnectedTo(result.map(|r| (r, addr))));
+                                let _ = sender.send(Event::ConnectedTo { addr, result });
                             }
 
                             Command::Disconnect(peer) => match streams.try_remove(peer.value()) {

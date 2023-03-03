@@ -63,7 +63,7 @@ fn shutdown_test(port: u16, shutdown_command: Command, client_is_leaving: bool) 
 
     assert!(matches!(
         client_handle.receive().unwrap(),
-        Event::ConnectedTo(_)
+        Event::ConnectedTo { .. }
     ));
 
     assert!(matches!(

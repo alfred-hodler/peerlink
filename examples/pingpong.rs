@@ -42,7 +42,10 @@ fn main() -> std::io::Result<()> {
 
     match handle.receive()? {
         // We want a successful connection here, everything else is an error.
-        Event::ConnectedTo(Ok((peer, peer_addr_2))) => {
+        Event::ConnectedTo {
+            addr: peer_addr_2,
+            result: Ok(peer),
+        } => {
             assert_eq!(peer_addr_2, peer_addr);
 
             // We are connected, initiate a handshake.
