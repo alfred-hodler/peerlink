@@ -84,8 +84,8 @@ pub enum DisconnectReason {
     Requested,
     /// The peer left and the end of stream was reached.
     Left,
-    /// The peer violated the protocol in some way.
-    BadPeer,
+    /// The peer violated the protocol in some way, usually by sending a malformed message.
+    CodecViolation,
     /// The write side is stale, i.e. the peer is not reading the data we are sending.
     WriteStale,
     /// An IO error occurred.
@@ -301,7 +301,7 @@ fn run<C: Connector + Sync + Send + 'static>(
                                     }
                                 } else {
                                     Err(io::Error::new(
-                                        io::ErrorKind::ConnectionRefused,
+                                        io::ErrorKind::OutOfMemory,
                                         "Too many connections are open",
                                     ))
                                 };
@@ -330,7 +330,7 @@ fn run<C: Connector + Sync + Send + 'static>(
                                     });
                                 } else {
                                     let _ = sender.send(Event::NoPeer(peer));
-                                    log::warn!("disconnect: peer {} not found", peer.value());
+                                    log::warn!("disconnect: peer {peer} not found");
                                 }
                             }
 
@@ -353,7 +353,7 @@ fn run<C: Connector + Sync + Send + 'static>(
 
                                 None => {
                                     let _ = sender.send(Event::NoPeer(peer));
-                                    log::warn!("message: peer {} not found", peer.value());
+                                    log::warn!("message: peer {peer} not found");
                                 }
                             },
 
@@ -362,7 +362,13 @@ fn run<C: Connector + Sync + Send + 'static>(
                                     let _ = write(&mut entry.stream, now);
                                     let r =
                                         entry.stream.inner_mut().shutdown(std::net::Shutdown::Both);
-                                    log::debug!("shut down stream {}: {:?}", id, r);
+
+                                    log::debug!(
+                                        "shutdown: stream {} for peer {}: {:?}",
+                                        id,
+                                        entry.peer_id,
+                                        r
+                                    );
                                 }
 
                                 return Ok(());
@@ -441,7 +447,7 @@ fn run<C: Connector + Sync + Send + 'static>(
 
                                         let _ = sender.send(Event::Disconnected {
                                             peer,
-                                            reason: DisconnectReason::BadPeer,
+                                            reason: DisconnectReason::CodecViolation,
                                         });
 
                                         break 'stream;
