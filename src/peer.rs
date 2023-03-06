@@ -1,23 +1,12 @@
-/// Unique peer identifier. The user should assume these can be reused by different peers as
-/// peers come and go, i.e. they are not assigned just once for the lifetime of the process.
+/// Unique peer identifier. These are unique for the lifetime of the process and strictly
+/// incrementing for each new connection. Even if the same peer (in terms of socket address)
+/// connects multiple times, a new `PeerId` instance will be issued for each connection.
 #[derive(Debug, Clone, Hash, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PeerId(pub usize);
+pub struct PeerId(pub u64);
 
 impl PeerId {
-    pub fn value(&self) -> usize {
+    pub fn value(&self) -> u64 {
         self.0
-    }
-}
-
-impl From<mio::Token> for PeerId {
-    fn from(token: mio::Token) -> Self {
-        Self(token.0)
-    }
-}
-
-impl From<PeerId> for mio::Token {
-    fn from(id: PeerId) -> Self {
-        Self(id.0)
     }
 }
 

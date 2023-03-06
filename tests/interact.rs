@@ -115,7 +115,7 @@ fn many_to_one_interleaved() {
             client_reactor.run();
 
             let (client_peer, _) = connect(&client, &server, server_addr);
-            assert_eq!(i, client_peer.0);
+            assert_eq!(i as u64, client_peer.0);
 
             client
         })
@@ -125,7 +125,7 @@ fn many_to_one_interleaved() {
         for (i, c) in clients.iter().enumerate() {
             message(c, PeerId(0), NetworkMessage::Ping(nonce));
             let ping_from_peer = expect_ping(server.receive().unwrap(), nonce);
-            assert_eq!(ping_from_peer, PeerId(i));
+            assert_eq!(ping_from_peer, PeerId(i as u64));
             message(&server, ping_from_peer, NetworkMessage::Pong(nonce));
             expect_pong(c.receive().unwrap(), nonce);
         }
@@ -163,7 +163,7 @@ fn many_to_one_bulk() {
             client_reactor.run();
 
             let (client_peer, _) = connect(&client, &server, server_addr);
-            assert_eq!(i, client_peer.0);
+            assert_eq!(i as u64, client_peer.0);
 
             client
         })
@@ -231,6 +231,38 @@ fn very_large() {
     }
 }
 
+/// Starts one server and sequentally connects and disconnects clients to it. Verifies that each
+/// peer id from the perspective of the server is unique, i.e. that there is no peer id reuse.
+#[test]
+fn peer_id_increments() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8106).into();
+
+    let server_config = Config {
+        bind_addr: vec![server_addr],
+        ..Default::default()
+    };
+
+    let (server_reactor, server) = Reactor::new(server_config).unwrap();
+    server_reactor.run();
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let n_clients = 5;
+
+    for i in 0..n_clients {
+        let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
+        client_reactor.run();
+
+        let (client_peer, _) = connect(&client, &server, server_addr);
+        assert_eq!(i as u64, client_peer.0);
+
+        let client_that_left = disconnect(&client, &server, PeerId(0));
+        assert_eq!(client_that_left, client_peer);
+    }
+}
+
 #[allow(dead_code)]
 struct Scaffold {
     server: Handle,
@@ -293,6 +325,33 @@ fn connect(client: &Handle, server: &Handle, server_addr: SocketAddr) -> (PeerId
     };
 
     (client_peer, server_peer)
+}
+
+fn disconnect(client: &Handle, server: &Handle, server_peer: PeerId) -> PeerId {
+    client.send(Command::Disconnect(server_peer)).unwrap();
+
+    let client_that_left = match server.receive().unwrap() {
+        peerlink::Event::Disconnected {
+            peer,
+            reason: DisconnectReason::Left,
+        } => {
+            println!("server: client has disconnected");
+            peer
+        }
+        _ => panic!(),
+    };
+
+    match client.receive().unwrap() {
+        peerlink::Event::Disconnected {
+            peer,
+            reason: DisconnectReason::Requested,
+        } if peer == server_peer => {
+            println!("client: disconnected from server");
+        }
+        _ => panic!(),
+    };
+
+    client_that_left
 }
 
 fn message(handle: &Handle, peer: PeerId, message: NetworkMessage) {

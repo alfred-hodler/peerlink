@@ -15,6 +15,7 @@ socks = ["dep:socks"]
 [dependencies]
 bitcoin = "0.29.2"
 crossbeam-channel = "0.5.7"
+intmap = "2.0.0"
 log = "0.4.17"
 mio = { version = "0.8.6", features = ["net", "os-poll"] }
 slab = "0.4.8"
