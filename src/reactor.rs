@@ -223,10 +223,33 @@ impl Handle {
     }
 }
 
-/// Contains a stream along with its peer id.
+/// The direction of a peer connection.
+enum Direction {
+    Inbound { interface: SocketAddr },
+    Outbound,
+}
+
+impl Direction {
+    fn is_outbound(&self) -> bool {
+        match self {
+            Direction::Inbound { .. } => false,
+            Direction::Outbound => true,
+        }
+    }
+}
+
+enum ConnectState {
+    InProgress { start: Instant },
+    Connected,
+}
+
+/// Contains a stream along with metadata.
 struct Entry {
     stream: MessageStream<TcpStream>,
     peer_id: PeerId,
+    direction: Direction,
+    connect_state: ConnectState,
+    addr: SocketAddr,
 }
 
 /// Runs the reactor in a loop until an error is produced or a shutdown command is received.
@@ -266,7 +289,7 @@ fn run<C: Connector + Sync + Send + 'static>(
     let mut remove_stale: Vec<PeerId> = Vec::with_capacity(16);
 
     loop {
-        poll.poll(&mut events, Some(Duration::from_secs(5)))?;
+        poll.poll(&mut events, Some(Duration::from_secs(1)))?;
 
         let has_slot = has_slot(listeners.len(), streams.vacant_key());
         let now = Instant::now();
@@ -289,6 +312,8 @@ fn run<C: Connector + Sync + Send + 'static>(
                                                 &mut streams,
                                                 &mut token_map,
                                                 &mut next_peer_id,
+                                                addr,
+                                                Direction::Outbound,
                                                 stream,
                                                 config.stream_config.clone(),
                                             )?;
@@ -306,7 +331,9 @@ fn run<C: Connector + Sync + Send + 'static>(
                                     ))
                                 };
 
-                                let _ = sender.send(Event::ConnectedTo { addr, result });
+                                if result.is_err() {
+                                    let _ = sender.send(Event::ConnectedTo { addr, result });
+                                }
                             }
 
                             Command::Disconnect(peer) => {
@@ -393,16 +420,12 @@ fn run<C: Connector + Sync + Send + 'static>(
                                     &mut streams,
                                     &mut token_map,
                                     &mut next_peer_id,
+                                    addr,
+                                    Direction::Inbound { interface },
                                     stream,
                                     config.stream_config.clone(),
                                 )?;
                                 log::info!("peer {peer}: accepted connection from {addr}");
-
-                                let _ = sender.send(Event::ConnectedFrom {
-                                    peer,
-                                    addr,
-                                    interface,
-                                });
                             }
                             Err(err) if would_block(&err) => break,
                             Err(err) => log::warn!("accept error: {}", err),
@@ -413,9 +436,38 @@ fn run<C: Connector + Sync + Send + 'static>(
                 (token, Some(entry)) => {
                     let peer = entry.peer_id;
 
-                    if !entry.stream.is_ready() {
-                        log::trace!("peer: {peer}: stream not ready");
-                        continue;
+                    match entry.connect_state {
+                        ConnectState::InProgress { .. } => {
+                            if !entry.stream.is_ready() {
+                                log::trace!("peer: {peer}: stream not ready");
+                                continue;
+                            } else {
+                                entry.connect_state = ConnectState::Connected;
+
+                                let event = match entry.direction {
+                                    Direction::Inbound { interface } => Event::ConnectedFrom {
+                                        peer,
+                                        addr: entry.addr,
+                                        interface,
+                                    },
+                                    Direction::Outbound => Event::ConnectedTo {
+                                        addr: entry.addr,
+                                        result: Ok(peer),
+                                    },
+                                };
+
+                                poll.registry().reregister(
+                                    entry.stream.inner_mut(),
+                                    token,
+                                    Interest::READABLE,
+                                )?;
+
+                                let _ = sender.send(event);
+                            }
+
+                            continue;
+                        }
+                        ConnectState::Connected => {}
                     }
 
                     if event.is_readable() {
@@ -540,22 +592,42 @@ fn run<C: Connector + Sync + Send + 'static>(
             }
         }
 
-        // stale stream removal
-        remove_stale.extend(
-            streams
-                .iter()
-                .filter_map(|(_, entry)| entry.stream.is_write_stale(now).then_some(entry.peer_id)),
-        );
+        // dead stream removal
+        let must_remove = streams
+            .iter()
+            .filter_map(|(_, entry)| match entry.connect_state {
+                ConnectState::InProgress { start }
+                    if (now - start) > config.stream_config.stream_connect_timeout =>
+                {
+                    if entry.direction.is_outbound() {
+                        let _ = sender.send(Event::ConnectedTo {
+                            addr: entry.addr,
+                            result: Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "Connect attempt timed out",
+                            )),
+                        });
+                    }
+
+                    Some(entry.peer_id)
+                }
+                ConnectState::Connected if entry.stream.is_write_stale(now) => {
+                    let _ = sender.send(Event::Disconnected {
+                        peer: entry.peer_id,
+                        reason: DisconnectReason::WriteStale,
+                    });
+
+                    Some(entry.peer_id)
+                }
+                _ => None,
+            });
+
+        remove_stale.extend(must_remove);
 
         for peer in remove_stale.drain(..) {
-            log::info!("removing stale peer {peer}");
+            log::info!("removing dead peer {peer}");
 
             remove_stream(poll.registry(), &mut streams, &mut token_map, peer)?;
-
-            let _ = sender.send(Event::Disconnected {
-                peer,
-                reason: DisconnectReason::WriteStale,
-            });
         }
 
         // periodic buffer resize
@@ -660,18 +732,21 @@ fn write(stream: &mut MessageStream<TcpStream>, now: Instant) -> io::Result<()> 
 }
 
 /// Registers a peer with the poll and adds him to the stream list.
+#[allow(clippy::too_many_arguments)]
 fn add_stream(
     registry: &Registry,
     streams: &mut Slab<Entry>,
     token_map: &mut IntMap<Token>,
     next_peer_id: &mut u64,
+    addr: SocketAddr,
+    direction: Direction,
     mut stream: TcpStream,
     stream_cfg: message_stream::StreamConfig,
 ) -> std::io::Result<PeerId> {
     let token = Token(streams.vacant_key());
     let peer_id = *next_peer_id;
 
-    registry.register(&mut stream, token, Interest::READABLE)?;
+    registry.register(&mut stream, token, Interest::WRITABLE)?;
 
     let prev_mapping = token_map.insert(peer_id, token);
     assert!(prev_mapping.is_none());
@@ -679,6 +754,11 @@ fn add_stream(
     streams.insert(Entry {
         stream: MessageStream::new(stream, stream_cfg),
         peer_id: PeerId(peer_id),
+        direction,
+        connect_state: ConnectState::InProgress {
+            start: Instant::now(),
+        },
+        addr,
     });
 
     *next_peer_id += 1;

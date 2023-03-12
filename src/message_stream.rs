@@ -20,6 +20,8 @@ pub struct StreamConfig {
     pub tx_buf_limits: std::ops::Range<usize>,
     /// The duration after which a peer is disconnected if it fails to read incoming data.
     pub stream_write_timeout: std::time::Duration,
+    /// The duration after which a connection attempt is abandoned.
+    pub stream_connect_timeout: std::time::Duration,
 }
 
 impl Default for StreamConfig {
@@ -28,6 +30,7 @@ impl Default for StreamConfig {
             rx_buf_min_size: 128 * 1024,
             tx_buf_limits: (128 * 1024)..message::MAX_MSG_SIZE,
             stream_write_timeout: std::time::Duration::from_secs(30),
+            stream_connect_timeout: std::time::Duration::from_secs(5),
         }
     }
 }
