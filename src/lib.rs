@@ -1,71 +1,26 @@
-//! # Peerlink
+//! # Peer-to-peer networking reactor
 //!
-//! Peerlink is a low-level network client for Bitcoin. It is designed to abstract away and hide
-//! networking logic and allow the consumer to focus on communicating with other peers on the
-//! network. Message streaming, buffering and basic peer management is handled by the library.
+//! Peerlink is a low-level building block for P2P applications. It uses a nonblocking reactor to
+//! accept inbound connections, make outbound connections, do message streaming and reassembly,
+//! track peers and perform other low-level operations. It entirely abstracts away menial
+//! networking plumbing such as managing TCP sockets and reading bytes off the wire. In other
+//! words, it provides the consumer with a simple interface to talking with other nodes in a P2P
+//! network.
 //!
-//! The way to use this crate is to create a `Reactor` instance, acquire its messaging handle
-//! and let the reactor run on its own thread. The API consumer then communicates with the reactor
-//! using a `Handle` instance.
-//!
-//! # User Agent Handling
-//!
-//! While Peerlink does not enforce any particular user agent string format when sending out
-//! `version` messages, please use the `user_agent` function in the crate root to create a well
-//! formatted BIP0014 UA string. Doing so ensures that Peerlink is identifying itself properly to
-//! the network.
-//!
-//! # Example
-//!
-//! The following example covers connecting to a Bitcoin node running on localhost, sending
-//! a message and then shutting down the reactor.
-//!
-//! ```no_run
-//! # use bitcoin::network::message::RawNetworkMessage;
-//! # fn main() -> std::io::Result<()> {
-//! let config = peerlink::Config {
-//!     // empty vec means we aren't listening for inbound connections
-//!     bind_addr: vec![],
-//!     ..Default::default()
-//! };
-//!
-//! let (reactor, handle) = peerlink::Reactor::new(config)?;
-//!
-//! // start the reactor (spawns its own thread)
-//! let reactor_join_handle = reactor.run();
-//!
-//! // issue a command to connect to our peer
-//! handle.send(peerlink::Command::Connect("127.0.0.1:8333".parse().unwrap()))?;
-//!
-//! // expect a `ConnectedTo` event if everything went well
-//! let peer = match handle.receive()? {
-//!     peerlink::Event::ConnectedTo { addr, result: Ok(peer)} => {
-//!         println!("Connected to peer {} at address {}", peer, addr);
-//!         peer
-//!     }
-//!     _ => panic!("not interested in other messages yet"),
-//! };
-//!
-//! // send a message to the peer and perform other operations...
-//! handle.send(peerlink::Command::Message(peer, RawNetworkMessage {magic: todo!(), payload: todo!()}))?;
-//!
-//! // When done, shut down the reactor and join with its thread
-//! handle.send(peerlink::Command::Shutdown)?;  
-//! let _ = reactor_join_handle.join();
-//!
-//! # Ok(())
-//! # }
-//! ```
+//! See the included example for usage.
 
 mod message_stream;
-mod peer;
 pub mod reactor;
 
-pub use bitcoin;
 pub use message_stream::StreamConfig;
 pub use mio::net::TcpStream;
-pub use peer::PeerId;
-pub use reactor::{Command, Connector, Event, Reactor};
+pub use reactor::{Command, Connector, Event, Handle, Reactor};
+
+#[cfg(not(feature = "async"))]
+pub use crossbeam_channel;
+
+#[cfg(feature = "async")]
+pub use async_channel;
 
 /// Configuration parameters for the reactor.
 #[derive(Debug, Default)]
@@ -73,28 +28,49 @@ pub struct Config {
     /// The list of socket addresses where the reactor listens for inbound connections.
     pub bind_addr: Vec<std::net::SocketAddr>,
     /// Configuration parameters for individual peer connections. This allows the fine tuning of
-    /// internal buffer sizes etc. Most consumers won't have to modify this.
+    /// internal buffer sizes etc. Most consumers won't have to modify the default values.
     pub stream_config: StreamConfig,
 }
 
-/// Creates a well formed BIP0014 user agent string that should be used with `version` messages.
-/// For instance, if `app_name` is `supernode` and `app_version` is `0.6.5` and the version of
-/// Peerlink being used is `0.4.0`, the resulting string will be `/peerlink:0.4.0/supernode:0.6.5/`.
-pub fn user_agent(app_name: &str, app_version: &str) -> String {
-    format!(
-        "/peerlink:{}/{app_name}:{app_version}/",
-        env!("CARGO_PKG_VERSION")
-    )
+/// A trait that network messages processed by the reactor must implement.
+pub trait Message: std::fmt::Debug + Sized + Send + Sync + 'static {
+    /// Encodes a message into a writer. This is an in-memory writer that never panics so there is
+    /// no need to handle the error path.
+    fn encode(&self, dest: &mut impl std::io::Write);
+
+    /// Provides access to the underlying read buffer. The buffer may contain any number of
+    /// messages, including no messages at all or only a partial message. If there are enough bytes
+    /// available to decode a message, the function must return an `Ok` with the decoded message
+    /// and the number of bytes it consumed.
+    ///
+    /// If there is not enough data to decode a message (i.e. it is available only partially),
+    /// `Err(DecodeError::NotEnoughData)` must be returned. That signals that the read should be
+    /// retried. If the message cannot be decoded at all, or exceeds size limits or otherwise
+    /// represents junk data, `Err(DecodeError::MalformedMessage)` must be returned. Such peers are
+    /// disconnected as protocol violators.
+    fn decode(buffer: &[u8]) -> Result<(Self, usize), DecodeError>;
 }
 
-#[cfg(test)]
-mod test {
-    #[test]
-    fn ua_format() {
-        let ua = super::user_agent("supernode", "0.6.5");
-        assert_eq!(
-            ua,
-            format!("/peerlink:{}/supernode:0.6.5/", env!("CARGO_PKG_VERSION"))
-        );
+/// Possible reasons why a message could not be decoded at a particular time.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// There is not enough data available to reconstruct a message. This does not indicate an
+    /// irrecoverable problem, it just means that not enough data has been taken of the wire yet
+    /// and that the operation should be retried once more data comes in.
+    NotEnoughData,
+    /// The message is malformed in some way. Once this is encountered, the peer that sent it
+    /// is disconnected.
+    MalformedMessage,
+}
+
+/// Unique peer identifier. These are unique for the lifetime of the process and strictly
+/// incrementing for each new connection. Even if the same peer (in terms of socket address)
+/// connects multiple times, a new `PeerId` instance will be issued for each connection.
+#[derive(Debug, Clone, Hash, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PeerId(pub u64);
+
+impl std::fmt::Display for PeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}", self.0))
     }
 }

@@ -3,6 +3,9 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use peerlink::reactor::DisconnectReason;
 use peerlink::{Command, Config, Event, PeerId, Reactor};
 
+mod common;
+use common::Message;
+
 // These tests are designed to perform client and server disconnects in a variety of manners:
 // orderly, disorderly, and abrupt. In each instance, the remaining party must notice the
 // disconnect immediately and without fail.
@@ -37,7 +40,7 @@ fn server_abrupt_leave() {
     shutdown_test(8005, Command::Panic, false);
 }
 
-fn shutdown_test(port: u16, shutdown_command: Command, client_is_leaving: bool) {
+fn shutdown_test(port: u16, shutdown_command: Command<Message>, client_is_leaving: bool) {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
@@ -59,15 +62,17 @@ fn shutdown_test(port: u16, shutdown_command: Command, client_is_leaving: bool) 
     // running machine is fast enough.
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    client_handle.send(Command::Connect(server_addr)).unwrap();
+    client_handle
+        .send(Command::Connect(server_addr.to_string()))
+        .unwrap();
 
     assert!(matches!(
-        client_handle.receive().unwrap(),
+        client_handle.receive_blocking().unwrap(),
         Event::ConnectedTo { .. }
     ));
 
     assert!(matches!(
-        server_handle.receive().unwrap(),
+        server_handle.receive_blocking().unwrap(),
         Event::ConnectedFrom { .. }
     ));
 
@@ -80,7 +85,7 @@ fn shutdown_test(port: u16, shutdown_command: Command, client_is_leaving: bool) 
     leaving.send(shutdown_command).unwrap();
 
     assert!(matches!(
-        remaining.receive().unwrap(),
+        remaining.receive_blocking().unwrap(),
         Event::Disconnected {
             reason: DisconnectReason::Left,
             ..

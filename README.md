@@ -5,18 +5,15 @@
 [![License](https://img.shields.io/crates/l/peerlink.svg)](https://github.com/alfred-hodler/peerlink/blob/master/LICENSE)
 [![Test Status](https://github.com/alfred-hodler/peerlink/actions/workflows/rust.yml/badge.svg)](https://github.com/alfred-hodler/peerlink/actions)
 
-**What is Peerlink?** Peerlink is a low-level network client for the Bitcoin P2P network written in Rust. It uses a nonblocking reactor to accept inbound connections, make outbound connections, perform message streaming and reassembly, track peers and perform other low-level network operations.
+**What is Peerlink?** Peerlink is a low-level building block for P2P applications. It uses a nonblocking reactor to accept inbound connections, make outbound connections, do message streaming and reassembly, track peers and perform other low-level operations. It entirely abstracts away menial networking plumbing such as managing TCP sockets and reading bytes off the wire. In other words, it provides the consumer with a simple interface to talking with other nodes in a P2P network.
 
-**What is it not?** It is not a node. It contains no state machine whatsoever except for the networking reactor. While it is capable of handling an almost unlimited number of connections, it does not automatically perform handshakes or pingpongs. It is entirely up to the consumer of the API to make sure that required messages are being sent out and that incoming messages are handled in a desired manner.
+**How is this meant to be used?** Mainly as a building block for a variety of applications that communicate in a P2P fashion. For instance, if writing a Bitcoin node or BitTorrent client implementation, Peerlink can handle and abstract away the networking aspect and provide the developer with simplified messaging capabilities and enable them to focus on the business logic of their application. There is a single trait called `Message` that needs to be implemented on whatever message type you plan on sending and receiving and Peerlink does the heavy lifting.
 
-**How is this meant to be used?** Mainly as a building block for a variety of applications that want to participate on the Bitcoin network. For instance, if writing a full node or a CBF/Neutrino client, Peerlink can handle and abstract away the networking part and provide the developer with simplified messaging capabilities and enable them to focus on the business logic of their application. A naive example might be that of connecting to the network just to broadcast a one-off transaction and then immediately disconnecting. If that was all that was needed, running a full node would be cumbersome, as would writing all the networking plumbing in-house.
-
-**What is the state of the project?** The project is young but considered to be safe to use. The goal is to relatively quickly bring it to version `1.0`. Breaking API changes might take place until then, although that is not very likely.
-
-**What about async?** Peerlink uses nonblocking IO on a separate thread to perform all network operations. It provides the consumer with a messaging handle that can be used both in sync and async contexts. Async contexts should wrap any blocking reads in whatever manner avoids blocking the event loop. There are no plans to add the `async/await` paradigm to the project since async can trivially wrap sync calls but the reverse does not hold true without introducing a runtime.
+**How is this different from competitors?** The philosophy of this crate is extreme simplicity. Rather than make assumptions about NAT traversal, peer discovery, encryption and other application-level aspects of decentralized networking, Peerlink provides the developer with a simple API to connecting to other peers, handling incoming peers and sending and receiving arbitrary messages.
 
 ## Features
 
+- Simple usage (see [examples](examples)).
 - First class support for **proxying** (Socks5, Tor...)
 - **Efficient:** low latency operations based on nonblocking IO.
 - **Safe:** written in Rust.

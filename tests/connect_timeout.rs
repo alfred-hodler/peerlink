@@ -4,6 +4,9 @@ use std::time::Duration;
 
 use peerlink::{Config, Event, Reactor, StreamConfig};
 
+mod common;
+use common::Message;
+
 /// Connects a client to a nonexistent peer and waits for the timeout.
 #[test]
 fn client_connects_to_nonexistent() {
@@ -22,9 +25,9 @@ fn client_connects_to_nonexistent() {
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, u16::MAX);
 
-    let _ = client_handle.send(peerlink::Command::Connect(server_addr.into()));
+    let _ = client_handle.send(peerlink::Command::Connect(server_addr.to_string()));
 
-    let connected = client_handle.receive().unwrap();
+    let connected: Event<Message> = client_handle.receive_blocking().unwrap();
     assert!(matches!(
         connected,
         Event::ConnectedTo { result: Err(err), .. } if err.kind() == ErrorKind::TimedOut

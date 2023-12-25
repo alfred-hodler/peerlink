@@ -1,11 +1,12 @@
 use core::panic;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::thread::JoinHandle;
 
-use bitcoin::consensus::Decodable;
-use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
 use peerlink::reactor::{DisconnectReason, Handle};
 use peerlink::{Command, Config, Event, PeerId, Reactor};
+
+mod common;
+use common::Message;
 
 /// Starts one client and one server and performs ping-pongs between them in an interleaved manner.
 #[test]
@@ -20,10 +21,10 @@ fn interleaved() {
     let (client_peer, server_peer) = connect(&client, &server, server_addr);
 
     for nonce in 0..1000 {
-        message(&client, server_peer, NetworkMessage::Ping(nonce));
-        expect_ping(server.receive().unwrap(), nonce);
-        message(&server, client_peer, NetworkMessage::Pong(nonce));
-        expect_pong(client.receive().unwrap(), nonce);
+        message(&client, server_peer, Message::Ping(nonce));
+        expect_ping(server.receive_blocking().unwrap(), nonce);
+        message(&server, client_peer, Message::Pong(nonce));
+        expect_pong(client.receive_blocking().unwrap(), nonce);
     }
 }
 
@@ -41,23 +42,22 @@ fn stuff_messages() {
     let (_client_peer, server_peer) = connect(&client, &server, server_addr);
 
     for i in 0..1000 {
-        message(&client, server_peer, NetworkMessage::Ping(i));
+        message(&client, server_peer, Message::Ping(i));
     }
 
     client.send(Command::Disconnect(server_peer)).unwrap();
 
     for i in 0..1000 {
-        expect_ping(server.receive().unwrap(), i);
+        expect_ping(server.receive_blocking().unwrap(), i);
     }
 
-    match server.receive().unwrap() {
+    match server.receive_blocking().unwrap() {
         peerlink::Event::Disconnected {
             reason: DisconnectReason::Left,
             ..
         } => {}
         event => {
-            println!("event: {:?}", event);
-            panic!("did not get disconnect");
+            panic!("did not get disconnect; event: {:?}", event);
         }
     }
 }
@@ -76,13 +76,13 @@ fn batches() {
     let (client_peer, server_peer) = connect(&client, &server, server_addr);
 
     for i in 0..1000 {
-        message(&client, server_peer, NetworkMessage::Ping(i));
-        message(&server, client_peer, NetworkMessage::Ping(i));
+        message(&client, server_peer, Message::Ping(i));
+        message(&server, client_peer, Message::Ping(i));
     }
 
     for i in 0..1000 {
-        expect_ping(server.receive().unwrap(), i);
-        expect_ping(client.receive().unwrap(), i);
+        expect_ping(server.receive_blocking().unwrap(), i);
+        expect_ping(client.receive_blocking().unwrap(), i);
     }
 }
 
@@ -108,13 +108,12 @@ fn many_to_one_interleaved() {
     let n_clients = 5;
 
     let clients: Vec<_> = (0..n_clients)
-        .into_iter()
         .enumerate()
         .map(|(i, _)| {
             let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
             client_reactor.run();
 
-            let (client_peer, _) = connect(&client, &server, server_addr);
+            let (client_peer, _) = connect(&client, &server, server_addr.to_string());
             assert_eq!(i as u64, client_peer.0);
 
             client
@@ -123,11 +122,11 @@ fn many_to_one_interleaved() {
 
     for nonce in 0..100 {
         for (i, c) in clients.iter().enumerate() {
-            message(c, PeerId(0), NetworkMessage::Ping(nonce));
-            let ping_from_peer = expect_ping(server.receive().unwrap(), nonce);
+            message(c, PeerId(0), Message::Ping(nonce));
+            let ping_from_peer = expect_ping(server.receive_blocking().unwrap(), nonce);
             assert_eq!(ping_from_peer, PeerId(i as u64));
-            message(&server, ping_from_peer, NetworkMessage::Pong(nonce));
-            expect_pong(c.receive().unwrap(), nonce);
+            message(&server, ping_from_peer, Message::Pong(nonce));
+            expect_pong(c.receive_blocking().unwrap(), nonce);
         }
     }
 }
@@ -156,13 +155,12 @@ fn many_to_one_bulk() {
     let n_pings = 100;
 
     let clients: Vec<_> = (0..n_clients)
-        .into_iter()
         .enumerate()
         .map(|(i, _)| {
             let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
             client_reactor.run();
 
-            let (client_peer, _) = connect(&client, &server, server_addr);
+            let (client_peer, _) = connect(&client, &server, server_addr.to_string());
             assert_eq!(i as u64, client_peer.0);
 
             client
@@ -171,26 +169,26 @@ fn many_to_one_bulk() {
 
     for nonce in 0..n_pings {
         for c in &clients {
-            message(c, PeerId(0), NetworkMessage::Ping(nonce));
+            message(c, PeerId(0), Message::Ping(nonce));
         }
     }
 
     // no guarantee that the server is processing every peer sequentially
     for _ in 0..(clients.len() * n_pings as usize) {
-        let (peer, nonce) = read_ping(server.receive().unwrap());
-        message(&server, peer, NetworkMessage::Pong(nonce));
+        let (peer, nonce) = read_ping(server.receive_blocking().unwrap());
+        message(&server, peer, Message::Pong(nonce));
     }
 
-    assert!(server.try_receive().is_none());
+    assert_eq!(server.receiver().len(), 0);
 
     for nonce in 0..100 {
         for c in &clients {
-            expect_pong(c.receive().unwrap(), nonce);
+            expect_pong(c.receive_blocking().unwrap(), nonce);
         }
     }
 
     for c in &clients {
-        assert!(c.try_receive().is_none());
+        assert_eq!(c.receiver().len(), 0);
     }
 }
 
@@ -204,30 +202,17 @@ fn very_large() {
     } = start_server_client(8105);
 
     let (client_peer, _) = connect(&client, &server, server_addr);
+    let ten_mb = vec![1; 1024 * 1024 * 10];
+    let message = Message::Data(ten_mb.clone());
 
-    let raw_block = include_bytes!("block_540107").to_vec();
-    let block = bitcoin::Block::consensus_decode(&mut raw_block.as_slice()).unwrap();
+    client.send(Command::Message(client_peer, message)).unwrap();
 
-    client
-        .send(Command::Message(
-            client_peer,
-            RawNetworkMessage {
-                magic: 0,
-                payload: NetworkMessage::Block(block.clone()),
-            },
-        ))
-        .unwrap();
-
-    match server.receive().unwrap() {
+    match server.receive_blocking().unwrap() {
         Event::Message {
-            message:
-                RawNetworkMessage {
-                    payload: NetworkMessage::Block(rx_block),
-                    ..
-                },
+            message: Message::Data(data),
             ..
-        } if block == rx_block => {}
-        _ => panic!(),
+        } if data == ten_mb => {}
+        _ => panic!(""),
     }
 }
 
@@ -255,7 +240,7 @@ fn peer_id_increments() {
         let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
         client_reactor.run();
 
-        let (client_peer, _) = connect(&client, &server, server_addr);
+        let (client_peer, _) = connect(&client, &server, server_addr.to_string());
         assert_eq!(i as u64, client_peer.0);
 
         let client_that_left = disconnect(&client, &server, PeerId(0));
@@ -265,11 +250,11 @@ fn peer_id_increments() {
 
 #[allow(dead_code)]
 struct Scaffold {
-    server: Handle,
-    client: Handle,
+    server: Handle<Message>,
+    client: Handle<Message>,
     server_join_handle: JoinHandle<Result<(), std::io::Error>>,
     client_join_handle: JoinHandle<Result<(), std::io::Error>>,
-    server_addr: SocketAddr,
+    server_addr: String,
 }
 
 fn start_server_client(server_port: u16) -> Scaffold {
@@ -299,14 +284,18 @@ fn start_server_client(server_port: u16) -> Scaffold {
         client: client_handle,
         server_join_handle,
         client_join_handle,
-        server_addr,
+        server_addr: server_addr.to_string(),
     }
 }
 
-fn connect(client: &Handle, server: &Handle, server_addr: SocketAddr) -> (PeerId, PeerId) {
+fn connect(
+    client: &Handle<Message>,
+    server: &Handle<Message>,
+    server_addr: String,
+) -> (PeerId, PeerId) {
     client.send(Command::Connect(server_addr)).unwrap();
 
-    let client_peer = match server.receive().unwrap() {
+    let client_peer = match server.receive_blocking().unwrap() {
         peerlink::Event::ConnectedFrom { peer, .. } => {
             println!("server: client has connected");
             peer
@@ -314,7 +303,7 @@ fn connect(client: &Handle, server: &Handle, server_addr: SocketAddr) -> (PeerId
         _ => panic!(),
     };
 
-    let server_peer = match client.receive().unwrap() {
+    let server_peer = match client.receive_blocking().unwrap() {
         peerlink::Event::ConnectedTo {
             result: Ok(peer), ..
         } => {
@@ -327,10 +316,10 @@ fn connect(client: &Handle, server: &Handle, server_addr: SocketAddr) -> (PeerId
     (client_peer, server_peer)
 }
 
-fn disconnect(client: &Handle, server: &Handle, server_peer: PeerId) -> PeerId {
+fn disconnect(client: &Handle<Message>, server: &Handle<Message>, server_peer: PeerId) -> PeerId {
     client.send(Command::Disconnect(server_peer)).unwrap();
 
-    let client_that_left = match server.receive().unwrap() {
+    let client_that_left = match server.receive_blocking().unwrap() {
         peerlink::Event::Disconnected {
             peer,
             reason: DisconnectReason::Left,
@@ -341,7 +330,7 @@ fn disconnect(client: &Handle, server: &Handle, server_peer: PeerId) -> PeerId {
         _ => panic!(),
     };
 
-    match client.receive().unwrap() {
+    match client.receive_blocking().unwrap() {
         peerlink::Event::Disconnected {
             peer,
             reason: DisconnectReason::Requested,
@@ -354,65 +343,42 @@ fn disconnect(client: &Handle, server: &Handle, server_peer: PeerId) -> PeerId {
     client_that_left
 }
 
-fn message(handle: &Handle, peer: PeerId, message: NetworkMessage) {
-    handle
-        .send(Command::Message(
-            peer,
-            RawNetworkMessage {
-                magic: 0,
-                payload: message,
-            },
-        ))
-        .unwrap();
+fn message(handle: &Handle<Message>, peer: PeerId, message: Message) {
+    handle.send(Command::Message(peer, message)).unwrap();
 }
 
-fn expect_ping(event: peerlink::Event, nonce: u64) -> PeerId {
+fn expect_ping(event: Event<Message>, nonce: u64) -> PeerId {
     match event {
         peerlink::Event::Message {
-            message:
-                RawNetworkMessage {
-                    payload: NetworkMessage::Ping(p),
-                    ..
-                },
+            message: Message::Ping(p),
             peer,
         } if nonce == p => peer,
         event => {
-            println!("expected Ping({nonce}) but got {:?}", event);
-            panic!()
+            panic!("expected Ping({nonce}) but got {:?}", event);
         }
     }
 }
 
-fn expect_pong(event: peerlink::Event, nonce: u64) -> PeerId {
+fn expect_pong(event: Event<Message>, nonce: u64) -> PeerId {
     match event {
         peerlink::Event::Message {
-            message:
-                RawNetworkMessage {
-                    payload: NetworkMessage::Pong(p),
-                    ..
-                },
+            message: Message::Pong(p),
             peer,
         } if nonce == p => peer,
         event => {
-            println!("expected Pong({nonce}) but got {:?}", event);
-            panic!()
+            panic!("expected Pong({nonce}) but got {:?}", event);
         }
     }
 }
 
-fn read_ping(event: peerlink::Event) -> (PeerId, u64) {
+fn read_ping(event: Event<Message>) -> (PeerId, u64) {
     match event {
         peerlink::Event::Message {
-            message:
-                RawNetworkMessage {
-                    payload: NetworkMessage::Ping(p),
-                    ..
-                },
+            message: Message::Ping(p),
             peer,
         } => (peer, p),
         event => {
-            println!("expected Ping(_) but got {:?}", event);
-            panic!()
+            panic!("expected Ping(_) but got {:?}", event);
         }
     }
 }

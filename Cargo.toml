@@ -5,21 +5,22 @@ edition = "2021"
 authors = ["Alfred Hodler <alfred_hodler@protonmail.com>"]
 license = "MIT"
 repository = "https://github.com/alfred-hodler/peerlink"
-description = "Low-level Bitcoin P2P Network Client"
-keywords = ["bitcoin"]
-categories = ["cryptography::cryptocurrencies"]
+description = "Low-level P2P Network Client"
+keywords = ["p2p", "peer-to-peer", "networking"]
+categories = ["network-programming"]
 
 [features]
 socks = ["dep:socks"]
+async = ["dep:async-channel"]
 
 [dependencies]
-bitcoin = "0.29.2"
-crossbeam-channel = "0.5.7"
+crossbeam-channel = "0.5.10"
 intmap = "2.0.0"
-log = "0.4.17"
-mio = { version = "0.8.6", features = ["net", "os-poll"] }
-slab = "0.4.8"
+log = "0.4.20"
+mio = { version = "0.8.10", features = ["net", "os-poll"] }
+slab = "0.4.9"
 socks = { version = "0.3.4", optional = true }
+async-channel = { version = "2.1.1", optional = true }
 
 [dev-dependencies]
-env_logger = "0.10.0"
+env_logger = "0.10.1"
