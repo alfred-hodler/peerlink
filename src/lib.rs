@@ -9,12 +9,13 @@
 //!
 //! See the included example for usage.
 
+pub mod connector;
 mod message_stream;
 pub mod reactor;
 
 pub use message_stream::StreamConfig;
 pub use mio::net::TcpStream;
-pub use reactor::{Command, Connector, Event, Handle, Reactor};
+pub use reactor::{Command, Event, Handle, Reactor};
 
 #[cfg(not(feature = "async"))]
 pub use crossbeam_channel;

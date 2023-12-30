@@ -1,5 +1,6 @@
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use intmap::IntMap;
@@ -7,6 +8,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use slab::Slab;
 
+use crate::connector::{self, Connector};
 use crate::message_stream::{self, MessageStream};
 use crate::{Config, DecodeError, Message, PeerId};
 
@@ -100,7 +102,7 @@ pub enum DisconnectReason {
 /// caller using [`Handle`].
 pub struct Reactor<C, M>
 where
-    C: Connector + Sync + Send + 'static,
+    C: Connector,
     M: Message,
 {
     poll: Poll,
@@ -108,17 +110,20 @@ where
     sender: EventSender<M>,
     receiver: Receiver<Command<M>>,
     connector: C,
+    waker: Arc<Waker>,
+    connect_tx: crossbeam_channel::Sender<ConnectResult>,
+    connect_rx: crossbeam_channel::Receiver<ConnectResult>,
 }
 
-impl<M: Message> Reactor<DefaultConnector, M> {
+impl<M: Message> Reactor<connector::DefaultConnector, M> {
     /// Creates a new reactor with the default connector.
     pub fn new(config: Config) -> io::Result<(Self, Handle<M>)> {
-        Self::with_connector(config, DefaultConnector)
+        Self::with_connector(config, connector::DefaultConnector)
     }
 }
 
 #[cfg(feature = "socks")]
-impl<M: Message> Reactor<Socks5Connector, M> {
+impl<M: Message> Reactor<connector::Socks5Connector, M> {
     /// Creates a new reactor that connects through a socks5 proxy. Credentials (username and
     /// password) are required if the proxy requires them.
     ///
@@ -128,7 +133,7 @@ impl<M: Message> Reactor<Socks5Connector, M> {
         proxy: SocketAddr,
         credentials: Option<(String, String)>,
     ) -> io::Result<(Self, Handle<M>)> {
-        Self::with_connector(config, Socks5Connector { proxy, credentials })
+        Self::with_connector(config, connector::Socks5Connector { proxy, credentials })
     }
 }
 
@@ -154,7 +159,7 @@ where
     /// Creates a new reactor with a custom connector.
     pub fn with_connector(config: Config, connector: C) -> io::Result<(Self, Handle<M>)> {
         let poll = Poll::new()?;
-        let waker = Waker::new(poll.registry(), WAKE_TOKEN)?;
+        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
 
         let (cmd_sender, cmd_receiver) = channel();
         let (event_sender, event_receiver) = channel();
@@ -162,8 +167,10 @@ where
         let command_sender = Handle {
             sender: cmd_sender,
             receiver: event_receiver,
-            waker,
+            waker: waker.clone(),
         };
+
+        let (connect_tx, connect_rx) = crossbeam_channel::unbounded();
 
         let reactor = Self {
             poll,
@@ -171,6 +178,9 @@ where
             sender: EventSender(event_sender),
             receiver: cmd_receiver,
             connector,
+            waker,
+            connect_tx,
+            connect_rx,
         };
 
         Ok((reactor, command_sender))
@@ -184,7 +194,7 @@ where
 
 /// Provides bidirectional communication with a reactor. If this is dropped the reactor stops.
 pub struct Handle<M: Message> {
-    waker: Waker,
+    waker: Arc<Waker>,
     sender: Sender<Command<M>>,
     receiver: Receiver<Event<M>>,
 }
@@ -262,7 +272,10 @@ fn run<C, M>(
         config,
         sender,
         receiver,
-        mut connector,
+        connector,
+        waker,
+        connect_tx,
+        connect_rx,
     }: Reactor<C, M>,
 ) -> io::Result<()>
 where
@@ -303,44 +316,39 @@ where
                 (WAKE_TOKEN, None) => {
                     log::trace!("waker event");
 
+                    for connect in connect_rx.try_iter() {
+                        let result = match connect.result {
+                            Ok(stream) => {
+                                add_stream(
+                                    poll.registry(),
+                                    &mut connections,
+                                    Direction::Outbound {
+                                        target: connect.target.clone(),
+                                    },
+                                    stream,
+                                    config.stream_config,
+                                )?;
+
+                                Ok(())
+                            }
+
+                            Err(err) => Err(err),
+                        };
+
+                        if let Err(err) = result {
+                            sender.send(Event::ConnectedTo {
+                                target: connect.target,
+                                result: Err(err),
+                            });
+                        }
+                    }
+
                     for cmd in std::iter::from_fn(|| receiver.try_recv().ok()) {
                         log::trace!("command: {:?}", cmd);
 
                         match cmd {
                             Command::Connect(target) => {
-                                let result = if has_slot(listeners.len(), connections.vacant_key())
-                                {
-                                    match connector.connect(&target) {
-                                        Ok(stream) => {
-                                            let peer = add_stream(
-                                                poll.registry(),
-                                                &mut connections,
-                                                Direction::Outbound {
-                                                    target: target.clone(),
-                                                },
-                                                stream,
-                                                config.stream_config,
-                                            )?;
-
-                                            log::debug!("connect: {target}");
-
-                                            Ok(peer)
-                                        }
-                                        Err(err) => Err(err),
-                                    }
-                                } else {
-                                    Err(io::Error::new(
-                                        io::ErrorKind::OutOfMemory,
-                                        "Too many connections are open",
-                                    ))
-                                };
-
-                                if let Err(err) = result {
-                                    sender.send(Event::ConnectedTo {
-                                        target,
-                                        result: Err(err),
-                                    });
-                                }
+                                initiate_connect(&connector, target, &waker, &connect_tx);
                             }
 
                             Command::Disconnect(peer) => {
@@ -661,69 +669,7 @@ where
     }
 }
 
-/// Types implementing this trait can connect to a target address in a custom manner before
-/// returning a `mio::net::TcpStream`. This can be used for proxying and other custom scenarios.
-/// It is the responsibility of the caller to put the stream into nonblocking mode. Failing
-/// to do so will block the reactor indefinitely and render it inoperable.
-pub trait Connector {
-    /// Connect to a target address and return a `mio` TCP stream.
-    fn connect(&mut self, target: &str) -> io::Result<mio::net::TcpStream>;
-}
-
-/// Default `Connector` implementation for `mio` that just connects to a target address.
-pub struct DefaultConnector;
-
-impl Connector for DefaultConnector {
-    fn connect(&mut self, target: &str) -> io::Result<mio::net::TcpStream> {
-        TcpStream::connect(target.to_socket_addrs()?.next().unwrap())
-    }
-}
-
-/// Connector that connects through a socks5 proxy.
-///
-/// The connector tries to put the socket in nonblocking mode and will retry that action several
-/// times before giving up. This could lead to small amounts of blocking but usually works out the
-/// first time without blocking.
-#[cfg(feature = "socks")]
-pub struct Socks5Connector {
-    /// The socket address of the proxy.
-    pub proxy: SocketAddr,
-    /// Optional socks username and password.
-    pub credentials: Option<(String, String)>,
-}
-
-#[cfg(feature = "socks")]
-impl Connector for Socks5Connector {
-    fn connect(&mut self, target: &str) -> io::Result<TcpStream> {
-        let stream = match self.credentials.as_ref() {
-            Some((username, password)) => {
-                socks::Socks5Stream::connect_with_password(self.proxy, target, username, password)?
-            }
-            None => socks::Socks5Stream::connect(self.proxy, target)?,
-        }
-        .into_inner();
-
-        let try_cycle_duration = Duration::from_millis(1);
-        let try_deadline = Duration::from_millis(5);
-
-        let mut elapsed = Duration::ZERO;
-        loop {
-            match stream.set_nonblocking(true) {
-                Ok(()) => break Ok(TcpStream::from_std(stream)),
-
-                Err(err) if would_block(&err) && elapsed < try_deadline => {
-                    std::thread::sleep(try_cycle_duration);
-                    elapsed += try_cycle_duration;
-                }
-
-                Err(err) => break Err(err),
-            }
-        }
-    }
-}
-
 /// Registers a peer with the poll and adds it to the connection list.
-#[allow(clippy::too_many_arguments)]
 fn add_stream(
     registry: &Registry,
     connections: &mut Slab<Connection>,
@@ -760,6 +706,49 @@ fn remove_stream(
     registry.deregister(connection.stream.as_source())?;
 
     Ok(connection)
+}
+
+/// Describes the result of a connect attempt against a remote host.
+struct ConnectResult {
+    target: String,
+    result: io::Result<mio::net::TcpStream>,
+}
+
+/// Initiates a connect procedure against a remote host using a `Connector` implementation.
+fn initiate_connect<C: Connector>(
+    connector: &C,
+    target: String,
+    waker: &Arc<Waker>,
+    sender: &crossbeam_channel::Sender<ConnectResult>,
+) {
+    #[inline]
+    fn connect<C: Connector>(
+        connector: &C,
+        target: String,
+        waker: &Arc<Waker>,
+        sender: &crossbeam_channel::Sender<ConnectResult>,
+    ) {
+        let start = Instant::now();
+        let result = connector.connect(&target);
+        let elapsed = Instant::now() - start;
+        log::debug!(
+            "connector: target={} elapsed={}ms",
+            target,
+            elapsed.as_millis()
+        );
+        let _ = sender.send(ConnectResult { target, result });
+        let _ = waker.wake();
+    }
+
+    if C::CONNECT_IN_BACKGROUND {
+        let waker = waker.clone();
+        let sender = sender.clone();
+        let connector = connector.clone();
+
+        std::thread::spawn(move || connect(&connector, target, &waker, &sender));
+    } else {
+        connect(connector, target, waker, sender)
+    }
 }
 
 /// Checks if a token is associated with the server (connection listener).

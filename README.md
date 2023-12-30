@@ -20,7 +20,11 @@
 
 ## Proxying
 
-To enable socks5 proxying, build with the `socks` feature enabled.
+To enable socks5 proxying, enable the `socks` feature.
+
+## Async/await
+
+By default the reactor exposes a blocking handle. To use this in async contexts, enable the `async` feature.
 
 ## Usage
 

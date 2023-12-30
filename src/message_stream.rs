@@ -20,7 +20,8 @@ pub struct StreamConfig {
     pub tx_buf_max_size: usize,
     /// The duration after which a peer is disconnected if it fails to read incoming data.
     pub stream_write_timeout: std::time::Duration,
-    /// The duration after which a connection attempt is abandoned.
+    /// The duration after which a connect attempt is abandoned. Applies only to non-blocking
+    /// connect attempts. Blocking ones performed in custom connectors ignore this value.
     pub stream_connect_timeout: std::time::Duration,
 }
 
