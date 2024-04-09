@@ -17,14 +17,16 @@ enum Message {
 // Then we define the codec for the messages we plan on sending and receiving. The encoding is
 // entirely arbitrary.
 impl peerlink::Message for Message {
-    fn encode(&self, dest: &mut impl std::io::Write) {
+    fn encode(&self, dest: &mut impl std::io::Write) -> usize {
         let (msg_type, value) = match &self {
             Message::Ping(p) => (b"ping", p),
             Message::Pong(p) => (b"pong", p),
         };
 
-        dest.write(msg_type).unwrap();
-        dest.write(&value.to_le_bytes()).unwrap();
+        let mut written = 0;
+        written += dest.write(msg_type).unwrap();
+        written += dest.write(&value.to_le_bytes()).unwrap();
+        written
     }
 
     fn decode(buffer: &[u8]) -> Result<(Self, usize), peerlink::DecodeError> {
@@ -52,7 +54,7 @@ fn server() -> std::io::Result<()> {
     println!("Server: starting to listen on address {}", bind_addr);
 
     // Create the reactor and get its handle.
-    let (reactor, handle) = Reactor::new(Config {
+    let (reactor, handle) = Reactor::<_, _, String>::new(Config {
         bind_addr: vec![bind_addr],
         ..Default::default()
     })?;

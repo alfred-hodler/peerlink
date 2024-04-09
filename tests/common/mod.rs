@@ -18,18 +18,26 @@ impl Message {
 }
 
 impl peerlink::Message for Message {
-    fn encode(&self, dest: &mut impl std::io::Write) {
+    fn encode(&self, dest: &mut impl std::io::Write) -> usize {
+        let mut written = 0;
+
         let _ = dest.write_all(self.prefix());
+        written += self.prefix().len();
 
         match self {
             Message::Ping(p) | Message::Pong(p) => {
                 let _ = dest.write_all(&p.to_le_bytes());
+                written += 8;
             }
             Message::Data(data) => {
                 let _ = dest.write_all(&(data.len() as u32).to_le_bytes());
+                written += 4;
                 let _ = dest.write_all(data);
+                written += data.len();
             }
         }
+
+        written
     }
 
     fn decode(buffer: &[u8]) -> Result<(Self, usize), DecodeError> {

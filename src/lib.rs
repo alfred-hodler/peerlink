@@ -37,7 +37,9 @@ pub struct Config {
 pub trait Message: std::fmt::Debug + Sized + Send + Sync + 'static {
     /// Encodes a message into a writer. This is an in-memory writer that never panics so there is
     /// no need to handle the error path.
-    fn encode(&self, dest: &mut impl std::io::Write);
+    ///
+    /// Returns the number of encoded bytes.
+    fn encode(&self, dest: &mut impl std::io::Write) -> usize;
 
     /// Provides access to the underlying read buffer. The buffer may contain any number of
     /// messages, including no messages at all or only a partial message. If there are enough bytes

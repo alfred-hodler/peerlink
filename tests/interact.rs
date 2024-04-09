@@ -250,8 +250,8 @@ fn peer_id_increments() {
 
 #[allow(dead_code)]
 struct Scaffold {
-    server: Handle<Message>,
-    client: Handle<Message>,
+    server: Handle<Message, String>,
+    client: Handle<Message, String>,
     server_join_handle: JoinHandle<Result<(), std::io::Error>>,
     client_join_handle: JoinHandle<Result<(), std::io::Error>>,
     server_addr: String,
@@ -289,8 +289,8 @@ fn start_server_client(server_port: u16) -> Scaffold {
 }
 
 fn connect(
-    client: &Handle<Message>,
-    server: &Handle<Message>,
+    client: &Handle<Message, String>,
+    server: &Handle<Message, String>,
     server_addr: String,
 ) -> (PeerId, PeerId) {
     client.send(Command::Connect(server_addr)).unwrap();
@@ -316,7 +316,11 @@ fn connect(
     (client_peer, server_peer)
 }
 
-fn disconnect(client: &Handle<Message>, server: &Handle<Message>, server_peer: PeerId) -> PeerId {
+fn disconnect(
+    client: &Handle<Message, String>,
+    server: &Handle<Message, String>,
+    server_peer: PeerId,
+) -> PeerId {
     client.send(Command::Disconnect(server_peer)).unwrap();
 
     let client_that_left = match server.receive_blocking().unwrap() {
@@ -343,11 +347,11 @@ fn disconnect(client: &Handle<Message>, server: &Handle<Message>, server_peer: P
     client_that_left
 }
 
-fn message(handle: &Handle<Message>, peer: PeerId, message: Message) {
+fn message(handle: &Handle<Message, String>, peer: PeerId, message: Message) {
     handle.send(Command::Message(peer, message)).unwrap();
 }
 
-fn expect_ping(event: Event<Message>, nonce: u64) -> PeerId {
+fn expect_ping(event: Event<Message, String>, nonce: u64) -> PeerId {
     match event {
         peerlink::Event::Message {
             message: Message::Ping(p),
@@ -359,7 +363,7 @@ fn expect_ping(event: Event<Message>, nonce: u64) -> PeerId {
     }
 }
 
-fn expect_pong(event: Event<Message>, nonce: u64) -> PeerId {
+fn expect_pong(event: Event<Message, String>, nonce: u64) -> PeerId {
     match event {
         peerlink::Event::Message {
             message: Message::Pong(p),
@@ -371,7 +375,7 @@ fn expect_pong(event: Event<Message>, nonce: u64) -> PeerId {
     }
 }
 
-fn read_ping(event: Event<Message>) -> (PeerId, u64) {
+fn read_ping(event: Event<Message, String>) -> (PeerId, u64) {
     match event {
         peerlink::Event::Message {
             message: Message::Ping(p),

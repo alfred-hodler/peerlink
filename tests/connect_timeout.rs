@@ -12,7 +12,7 @@ use common::Message;
 fn client_connects_to_nonexistent() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (client_reactor, client_handle) = Reactor::new(Config {
+    let (client_reactor, client_handle) = Reactor::<_, Message, String>::new(Config {
         stream_config: StreamConfig {
             stream_connect_timeout: Duration::from_secs(1),
             ..Default::default()
@@ -27,7 +27,7 @@ fn client_connects_to_nonexistent() {
 
     let _ = client_handle.send(peerlink::Command::Connect(server_addr.to_string()));
 
-    let connected: Event<Message> = client_handle.receive_blocking().unwrap();
+    let connected: Event<_, _> = client_handle.receive_blocking().unwrap();
     assert!(matches!(
         connected,
         Event::ConnectedTo { result: Err(err), .. } if err.kind() == ErrorKind::TimedOut

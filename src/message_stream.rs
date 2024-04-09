@@ -49,6 +49,8 @@ pub struct MessageStream<T: Read + Write> {
     rx_msg_buf: Vec<u8>,
     /// Buffer used for sending.
     tx_msg_buf: Vec<u8>,
+    /// The list of queue points for outgoing messages.
+    tx_queue_points: queue_points::Queue,
     /// Cached readyness.
     ready: bool,
     /// Last successful write time.
@@ -61,6 +63,7 @@ impl<T: Read + Write> MessageStream<T> {
             stream,
             rx_msg_buf: Vec::with_capacity(config.rx_buf_min_size),
             tx_msg_buf: Vec::with_capacity(config.tx_buf_min_size),
+            tx_queue_points: Default::default(),
             ready: false,
             last_write: Instant::now(),
             config,
@@ -125,7 +128,8 @@ impl<T: Read + Write> MessageStream<T> {
     #[must_use]
     pub fn queue_message<M: Message>(&mut self, message: &M) -> bool {
         if self.tx_msg_buf.len() <= self.config.tx_buf_max_size {
-            message.encode(&mut self.tx_msg_buf);
+            let encoded = message.encode(&mut self.tx_msg_buf);
+            self.tx_queue_points.append(encoded);
             true
         } else {
             false
@@ -135,7 +139,13 @@ impl<T: Read + Write> MessageStream<T> {
     /// Returns whether the stream is stale on the write side, i.e. the data is not leaving the
     /// send buffer in a timely manner.
     pub fn is_write_stale(&self, now: Instant) -> bool {
-        self.has_queued_data() && (now - self.last_write) >= self.config.stream_write_timeout
+        match self.tx_queue_points.first() {
+            Some(t) => {
+                let timeout = self.config.stream_write_timeout;
+                (now - t > timeout) && (now - self.last_write > timeout)
+            }
+            None => false,
+        }
     }
 
     /// Resizes and shrinks the capacity of internal send and receive buffers to their size or
@@ -163,6 +173,7 @@ impl<T: Read + Write> MessageStream<T> {
         self.tx_msg_buf.drain(..written);
         self.stream.flush()?;
         self.last_write = now;
+        self.tx_queue_points.handle_write(written);
         Ok(written)
     }
 
@@ -193,6 +204,92 @@ impl MessageStream<mio::net::TcpStream> {
     }
 }
 
+/// Provides a collection that tracks points in time where a message of certain size was queued.
+/// This allows the consumer to track how long ago a message was attempted to be sent out and how
+/// many bytes are yet to be sent.
+mod queue_points {
+    use std::time::Instant;
+
+    /// A single queue point given a point in time and the remaining number of bytes.
+    #[derive(Debug)]
+    struct Point {
+        time: Instant,
+        left: usize,
+    }
+
+    /// A list of queue points, from oldest to newest.
+    #[derive(Debug, Default)]
+    pub struct Queue(Vec<Point>);
+
+    impl Queue {
+        /// Signals to the current queue point that a number of bytes were written out.
+        pub fn handle_write(&mut self, n_written: usize) {
+            let mut n_bytes_left = n_written;
+            let mut n_pop = 0;
+
+            for q in &mut self.0 {
+                let q_written = n_bytes_left.min(q.left);
+                n_bytes_left -= q_written;
+                q.left -= q_written;
+
+                if q.left == 0 {
+                    n_pop += 1;
+                }
+
+                if n_bytes_left == 0 {
+                    break;
+                }
+            }
+
+            assert_eq!(n_bytes_left, 0);
+            self.0.drain(..n_pop);
+        }
+
+        /// Appends a new queue point of a certain size.
+        pub fn append(&mut self, size: usize) {
+            self.0.push(Point {
+                time: Instant::now(),
+                left: size,
+            })
+        }
+
+        /// Returns the creation instant of the first queue point, if any.
+        pub fn first(&self) -> Option<Instant> {
+            self.0.first().map(|p| p.time)
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn queue_behavior() {
+        let mut queue = Queue::default();
+
+        queue.append(10);
+        queue.append(20);
+        queue.append(30);
+
+        assert_eq!(queue.0[0].left, 10);
+        assert_eq!(queue.0[1].left, 20);
+        assert_eq!(queue.0[2].left, 30);
+
+        queue.handle_write(5);
+        assert_eq!(queue.0[0].left, 5);
+        assert_eq!(queue.0[1].left, 20);
+        assert_eq!(queue.0[2].left, 30);
+
+        queue.handle_write(5);
+        assert_eq!(queue.0[0].left, 20);
+        assert_eq!(queue.0[1].left, 30);
+
+        queue.handle_write(25);
+        assert_eq!(queue.0[0].left, 25);
+        assert_eq!(queue.0.len(), 1);
+
+        queue.handle_write(25);
+        assert!(queue.first().is_none());
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::io::Cursor;
@@ -203,8 +300,8 @@ mod test {
     struct Ping(u64);
 
     impl Message for Ping {
-        fn encode(&self, dest: &mut impl std::io::Write) {
-            dest.write(&self.0.to_le_bytes()).unwrap();
+        fn encode(&self, dest: &mut impl std::io::Write) -> usize {
+            dest.write(&self.0.to_le_bytes()).unwrap()
         }
 
         fn decode(buffer: &[u8]) -> Result<(Self, usize), DecodeError> {

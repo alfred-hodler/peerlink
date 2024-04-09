@@ -8,7 +8,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use slab::Slab;
 
-use crate::connector::{self, Connector};
+use crate::connector::{self, Connector, IntoTarget};
 use crate::message_stream::{self, MessageStream};
 use crate::{Config, DecodeError, Message, PeerId};
 
@@ -23,9 +23,9 @@ const WAKE_TOKEN: Token = Token(usize::MAX);
 
 /// Command variants for the reactor to process.
 #[derive(Debug)]
-pub enum Command<M: Message> {
-    /// Connect to a remote host. The valid format is either `"ip:port"` or `"hostname:port"`.
-    Connect(String),
+pub enum Command<M: Message, T: IntoTarget> {
+    /// Connect to a remote host.
+    Connect(T),
     /// Disconnect from a peer.
     Disconnect(PeerId),
     /// Send a message to a peer.
@@ -39,11 +39,11 @@ pub enum Command<M: Message> {
 
 // Event variants produced by the reactor.
 #[derive(Debug)]
-pub enum Event<M: Message> {
+pub enum Event<M: Message, T: IntoTarget> {
     /// The reactor attempted to connect to a remote peer.
     ConnectedTo {
         /// The remote host that was connected to. This is in the same format it was specified.
-        target: String,
+        target: T,
         /// The result of the connection attempt. A peer id is returned if successful.
         result: io::Result<PeerId>,
     },
@@ -100,30 +100,31 @@ pub enum DisconnectReason {
 
 /// Non-blocking network reactor. This always runs in its own thread and communicates with the
 /// caller using [`Handle`].
-pub struct Reactor<C, M>
+pub struct Reactor<C, M, T>
 where
     C: Connector,
     M: Message,
+    T: IntoTarget,
 {
     poll: Poll,
     config: Config,
-    sender: EventSender<M>,
-    receiver: Receiver<Command<M>>,
+    sender: EventSender<M, T>,
+    receiver: Receiver<Command<M, T>>,
     connector: C,
     waker: Arc<Waker>,
-    connect_tx: crossbeam_channel::Sender<ConnectResult>,
-    connect_rx: crossbeam_channel::Receiver<ConnectResult>,
+    connect_tx: crossbeam_channel::Sender<ConnectResult<T>>,
+    connect_rx: crossbeam_channel::Receiver<ConnectResult<T>>,
 }
 
-impl<M: Message> Reactor<connector::DefaultConnector, M> {
+impl<M: Message, T: IntoTarget> Reactor<connector::DefaultConnector, M, T> {
     /// Creates a new reactor with the default connector.
-    pub fn new(config: Config) -> io::Result<(Self, Handle<M>)> {
+    pub fn new(config: Config) -> io::Result<(Self, Handle<M, T>)> {
         Self::with_connector(config, connector::DefaultConnector)
     }
 }
 
 #[cfg(feature = "socks")]
-impl<M: Message> Reactor<connector::Socks5Connector, M> {
+impl<M: Message, T: IntoTarget> Reactor<connector::Socks5Connector, M, T> {
     /// Creates a new reactor that connects through a socks5 proxy. Credentials (username and
     /// password) are required if the proxy requires them.
     ///
@@ -132,18 +133,18 @@ impl<M: Message> Reactor<connector::Socks5Connector, M> {
         config: Config,
         proxy: SocketAddr,
         credentials: Option<(String, String)>,
-    ) -> io::Result<(Self, Handle<M>)> {
+    ) -> io::Result<(Self, Handle<M, T>)> {
         Self::with_connector(config, connector::Socks5Connector { proxy, credentials })
     }
 }
 
 /// Convenience type that allows us to easily switch between send implementations depending on the
 /// execution model and which feature is active.
-struct EventSender<M: Message>(Sender<Event<M>>);
+struct EventSender<M: Message, T: IntoTarget>(Sender<Event<M, T>>);
 
-impl<M: Message> EventSender<M> {
+impl<M: Message, T: IntoTarget> EventSender<M, T> {
     /// Sends an event to the handle.
-    fn send(&self, event: Event<M>) {
+    fn send(&self, event: Event<M, T>) {
         #[cfg(feature = "async")]
         let _ = self.0.send_blocking(event);
         #[cfg(not(feature = "async"))]
@@ -151,13 +152,14 @@ impl<M: Message> EventSender<M> {
     }
 }
 
-impl<C, M> Reactor<C, M>
+impl<C, M, T> Reactor<C, M, T>
 where
     C: Connector + Sync + Send + 'static,
     M: Message,
+    T: IntoTarget,
 {
     /// Creates a new reactor with a custom connector.
-    pub fn with_connector(config: Config, connector: C) -> io::Result<(Self, Handle<M>)> {
+    pub fn with_connector(config: Config, connector: C) -> io::Result<(Self, Handle<M, T>)> {
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
 
@@ -193,17 +195,17 @@ where
 }
 
 /// Provides bidirectional communication with a reactor. If this is dropped the reactor stops.
-pub struct Handle<M: Message> {
+pub struct Handle<M: Message, T: IntoTarget> {
     waker: Arc<Waker>,
-    sender: Sender<Command<M>>,
-    receiver: Receiver<Event<M>>,
+    sender: Sender<Command<M, T>>,
+    receiver: Receiver<Event<M, T>>,
 }
 
-impl<M: Message> Handle<M> {
+impl<M: Message, T: IntoTarget> Handle<M, T> {
     /// Sends a command to a reactor associated with this handle. If this produces an IO error,
     /// it means the reactor is irrecoverable and should be discarded. This method never blocks so
     /// it is appropriate for use in async contexts.
-    pub fn send(&self, command: Command<M>) -> io::Result<()> {
+    pub fn send(&self, command: Command<M, T>) -> io::Result<()> {
         #[cfg(not(feature = "async"))]
         let result = self.sender.send(command);
         #[cfg(feature = "async")]
@@ -222,7 +224,7 @@ impl<M: Message> Handle<M> {
     /// produced, the reactor is irrecoverable and should be discarded. While this method is
     /// available in async contexts, it **should not** be used there. Use `receiver()` to get a
     /// raw handle on the receiver for use in async scenarios or where extra API surfaces are required.
-    pub fn receive_blocking(&self) -> io::Result<Event<M>> {
+    pub fn receive_blocking(&self) -> io::Result<Event<M, T>> {
         #[cfg(not(feature = "async"))]
         let result = self.receiver.recv();
         #[cfg(feature = "async")]
@@ -233,21 +235,21 @@ impl<M: Message> Handle<M> {
 
     /// Exposes the receive portion of the handle. The receiver could be of a blocking or async
     /// variety, depending on which feature is active.
-    pub fn receiver(&self) -> &Receiver<Event<M>> {
+    pub fn receiver(&self) -> &Receiver<Event<M, T>> {
         &self.receiver
     }
 }
 
 /// The direction of a peer connection.
 #[derive(Debug)]
-enum Direction {
+enum Direction<T: IntoTarget> {
     /// The connection is from a remote peer to the reactor.
     Inbound {
         interface: SocketAddr,
         addr: SocketAddr,
     },
     /// The connection is from the reactor to a remote peer.
-    Outbound { target: String },
+    Outbound { target: T },
 }
 
 /// The state of a peer connection.
@@ -259,14 +261,14 @@ enum State {
 }
 
 /// Contains a TCP connection along with its metadata.
-struct Connection {
+struct Connection<T: IntoTarget> {
     stream: MessageStream<TcpStream>,
-    direction: Direction,
+    direction: Direction<T>,
     state: State,
 }
 
 /// Runs the reactor in a loop until an error is produced or the shutdown command is received.
-fn run<C, M>(
+fn run<C, M, T>(
     Reactor {
         mut poll,
         config,
@@ -276,11 +278,12 @@ fn run<C, M>(
         waker,
         connect_tx,
         connect_rx,
-    }: Reactor<C, M>,
+    }: Reactor<C, M, T>,
 ) -> io::Result<()>
 where
     C: Connector + Sync + Send + 'static,
     M: Message,
+    T: IntoTarget,
 {
     let listeners: Vec<_> = config
         .bind_addr
@@ -299,7 +302,7 @@ where
         })
         .collect::<std::io::Result<Vec<_>>>()?;
 
-    let mut connections: Slab<Connection> = Slab::with_capacity(16);
+    let mut connections: Slab<Connection<T>> = Slab::with_capacity(16);
     let mut events = Events::with_capacity(1024);
     let mut read_buf = [0; 1024 * 1024];
     let mut last_maintenance = Instant::now();
@@ -317,29 +320,25 @@ where
                     log::trace!("waker event");
 
                     for connect in connect_rx.try_iter() {
-                        let result = match connect.result {
+                        match connect.result {
                             Ok(stream) => {
                                 add_stream(
                                     poll.registry(),
                                     &mut connections,
                                     Direction::Outbound {
-                                        target: connect.target.clone(),
+                                        target: connect.target,
                                     },
                                     stream,
                                     config.stream_config,
                                 )?;
-
-                                Ok(())
                             }
 
-                            Err(err) => Err(err),
-                        };
-
-                        if let Err(err) = result {
-                            sender.send(Event::ConnectedTo {
-                                target: connect.target,
-                                result: Err(err),
-                            });
+                            Err(err) => {
+                                sender.send(Event::ConnectedTo {
+                                    target: connect.target,
+                                    result: Err(err),
+                                });
+                            }
                         }
                     }
 
@@ -670,10 +669,10 @@ where
 }
 
 /// Registers a peer with the poll and adds it to the connection list.
-fn add_stream(
+fn add_stream<T: IntoTarget>(
     registry: &Registry,
-    connections: &mut Slab<Connection>,
-    direction: Direction,
+    connections: &mut Slab<Connection<T>>,
+    direction: Direction<T>,
     mut stream: TcpStream,
     stream_cfg: message_stream::StreamConfig,
 ) -> std::io::Result<()> {
@@ -693,12 +692,12 @@ fn add_stream(
 }
 
 /// Deregisters a peer from the poll and removes it from the connection list.
-fn remove_stream(
+fn remove_stream<T: IntoTarget>(
     registry: &Registry,
-    connections: &mut Slab<Connection>,
+    connections: &mut Slab<Connection<T>>,
     token_map: &mut IntMap<Token>,
     peer: PeerId,
-) -> std::io::Result<Connection> {
+) -> std::io::Result<Connection<T>> {
     let token = token_map.remove(peer.0).expect("must exist here");
 
     let mut connection = connections.remove(token.0);
@@ -709,30 +708,30 @@ fn remove_stream(
 }
 
 /// Describes the result of a connect attempt against a remote host.
-struct ConnectResult {
-    target: String,
+struct ConnectResult<T: IntoTarget> {
+    target: T,
     result: io::Result<mio::net::TcpStream>,
 }
 
 /// Initiates a connect procedure against a remote host using a `Connector` implementation.
-fn initiate_connect<C: Connector>(
+fn initiate_connect<C: Connector, T: IntoTarget>(
     connector: &C,
-    target: String,
+    target: T,
     waker: &Arc<Waker>,
-    sender: &crossbeam_channel::Sender<ConnectResult>,
+    sender: &crossbeam_channel::Sender<ConnectResult<T>>,
 ) {
     #[inline]
-    fn connect<C: Connector>(
+    fn connect<C: Connector, T: IntoTarget>(
         connector: &C,
-        target: String,
+        target: T,
         waker: &Arc<Waker>,
-        sender: &crossbeam_channel::Sender<ConnectResult>,
+        sender: &crossbeam_channel::Sender<ConnectResult<T>>,
     ) {
         let start = Instant::now();
         let result = connector.connect(&target);
         let elapsed = Instant::now() - start;
         log::debug!(
-            "connector: target={} elapsed={}ms",
+            "connector: target={:?} elapsed={}ms",
             target,
             elapsed.as_millis()
         );
