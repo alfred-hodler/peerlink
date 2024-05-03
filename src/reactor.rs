@@ -10,7 +10,7 @@ use slab::Slab;
 
 use crate::connector::{self, Connector, IntoTarget};
 use crate::message_stream::{self, MessageStream};
-use crate::{Config, DecodeError, Message, PeerId};
+use crate::{Config, Message, PeerId};
 
 #[cfg(not(feature = "async"))]
 use crossbeam_channel::{Receiver, Sender};
@@ -304,7 +304,7 @@ where
 
     let mut connections: Slab<Connection<T>> = Slab::with_capacity(16);
     let mut events = Events::with_capacity(1024);
-    let mut read_buf = [0; 1024 * 1024];
+    let mut read_buf = vec![0; 1024 * 1024];
     let mut last_maintenance = Instant::now();
     let mut token_map: IntMap<Token> = IntMap::new();
     let mut next_peer_id: u64 = 0;
@@ -485,80 +485,30 @@ where
                     if event.is_readable() {
                         log::trace!("readable: peer {peer}");
 
-                        'read: loop {
-                            let read_result = connection.stream.read(&mut read_buf);
-
-                            'decode: loop {
-                                match connection.stream.receive_message::<M>() {
-                                    Ok(message) => {
-                                        log::debug!("read: peer {peer}: message={:?}", message);
-
-                                        sender.send(Event::Message { peer, message });
-                                    }
-
-                                    Err(DecodeError::MalformedMessage) => {
-                                        log::info!("read: peer {peer}: codec violation");
-
-                                        remove_stream(
-                                            poll.registry(),
-                                            &mut connections,
-                                            &mut token_map,
-                                            peer,
-                                        )?;
-
-                                        sender.send(Event::Disconnected {
-                                            peer,
-                                            reason: DisconnectReason::CodecViolation,
-                                        });
-
-                                        continue 'events;
-                                    }
-
-                                    Err(DecodeError::NotEnoughData) => break 'decode,
+                        if let Err(err) = connection.stream.read(&mut read_buf, |message| {
+                            log::debug!("read: peer {peer}: message={:?}", message);
+                            sender.send(Event::Message { peer, message });
+                        }) {
+                            let reason = match err {
+                                message_stream::ReadError::MalformedMessage => {
+                                    log::info!("read: peer {peer}: codec violation");
+                                    DisconnectReason::CodecViolation
                                 }
-                            }
-
-                            match read_result {
-                                Ok(0) => {
+                                message_stream::ReadError::EndOfStream => {
                                     log::debug!("peer {peer}: peer left");
-
-                                    remove_stream(
-                                        poll.registry(),
-                                        &mut connections,
-                                        &mut token_map,
-                                        peer,
-                                    )?;
-
-                                    sender.send(Event::Disconnected {
-                                        peer,
-                                        reason: DisconnectReason::Left,
-                                    });
-
-                                    continue 'events;
+                                    DisconnectReason::Left
                                 }
-
-                                Ok(_) => continue 'read,
-
-                                Err(err) if would_block(&err) => break 'read,
-
-                                Err(err) => {
-                                    log::debug!("peer {peer}: IO error: {err}");
-
-                                    remove_stream(
-                                        poll.registry(),
-                                        &mut connections,
-                                        &mut token_map,
-                                        peer,
-                                    )?;
-
-                                    sender.send(Event::Disconnected {
-                                        peer,
-                                        reason: DisconnectReason::Error(err),
-                                    });
-
-                                    continue 'events;
+                                message_stream::ReadError::Error(err) => {
+                                    log::debug!("write: peer {peer}: IO error: {err}");
+                                    DisconnectReason::Error(err)
                                 }
-                            }
+                            };
+
+                            remove_stream(poll.registry(), &mut connections, &mut token_map, peer)?;
+
+                            sender.send(Event::Disconnected { peer, reason });
+
+                            continue 'events;
                         }
                     }
 
@@ -574,8 +524,6 @@ where
                                     interest,
                                 )?;
                             }
-
-                            Err(err) if would_block(&err) => {}
 
                             Err(err) => {
                                 log::debug!("write: peer {peer}: IO error: {err}");
