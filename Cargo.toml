@@ -15,9 +15,9 @@ async = ["dep:async-channel"]
 
 [dependencies]
 crossbeam-channel = "0.5.10"
-intmap = "2.0.0"
 log = "0.4.20"
 mio = { version = "0.8.10", features = ["net", "os-poll"] }
+nohash-hasher = "0.2.0"
 slab = "0.4.9"
 socks = { version = "0.3.4", optional = true }
 async-channel = { version = "2.1.1", optional = true }

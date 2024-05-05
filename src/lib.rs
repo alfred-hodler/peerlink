@@ -24,13 +24,27 @@ pub use crossbeam_channel;
 pub use async_channel;
 
 /// Configuration parameters for the reactor.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Config {
     /// The list of socket addresses where the reactor listens for inbound connections.
     pub bind_addr: Vec<std::net::SocketAddr>,
     /// Configuration parameters for individual peer connections. This allows the fine tuning of
     /// internal buffer sizes etc. Most consumers won't have to modify the default values.
     pub stream_config: StreamConfig,
+    /// The size of the shared receive buffer, i.e. the max number of bytes that can be read in one
+    /// receive operation. Setting this too low can cause many reads to happen, whereas too high a
+    /// figure will use up more memory. The default is 1 megabyte.
+    pub receive_buffer_size: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bind_addr: Default::default(),
+            stream_config: Default::default(),
+            receive_buffer_size: 1024 * 1024,
+        }
+    }
 }
 
 /// A trait that network messages processed by the reactor must implement.
@@ -74,6 +88,6 @@ pub struct PeerId(pub u64);
 
 impl std::fmt::Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}", self.0))
+        write!(f, "{}", self.0)
     }
 }

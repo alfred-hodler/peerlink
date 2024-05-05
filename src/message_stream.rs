@@ -28,8 +28,8 @@ pub struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
-            rx_buf_min_size: 128 * 1024,
-            tx_buf_min_size: 128 * 1024,
+            rx_buf_min_size: 32 * 1024,
+            tx_buf_min_size: 32 * 1024,
             tx_buf_max_size: 1024 * 1024,
             stream_write_timeout: std::time::Duration::from_secs(30),
             stream_connect_timeout: std::time::Duration::from_secs(5),
@@ -71,7 +71,7 @@ impl<T: Read + Write> MessageStream<T> {
     pub fn new(stream: T, config: StreamConfig) -> Self {
         Self {
             stream,
-            rx_msg_buf: Vec::with_capacity(config.rx_buf_min_size),
+            rx_msg_buf: Vec::new(),
             tx_msg_buf: Vec::with_capacity(config.tx_buf_min_size),
             tx_queue_points: Default::default(),
             ready: false,
@@ -121,6 +121,10 @@ impl<T: Read + Write> MessageStream<T> {
                                         next_from += consumed;
                                     }
                                     Err(DecodeError::NotEnoughData) => {
+                                        if self.rx_msg_buf.capacity() == 0 {
+                                            self.rx_msg_buf
+                                                .reserve_exact(self.config.rx_buf_min_size);
+                                        }
                                         self.rx_msg_buf.extend_from_slice(next);
                                         break 'decode;
                                     }
@@ -200,13 +204,20 @@ impl<T: Read + Write> MessageStream<T> {
         }
     }
 
-    /// Resizes and shrinks the capacity of internal send and receive buffers to their size or
-    /// some set minimum, whichever is greater. This helps maintain memory usage at sane levels
-    /// since keeping permanent large receive buffers (e.g. after receiving a large message) would
-    /// eventually exhaust available memory on less powerful devices when managing many peers.
+    /// Resizes and shrinks the capacity of internal send and receive buffers by 1/3, until the
+    /// floor is reached. This helps maintain memory usage at sane levels since keeping permanent
+    /// large receive buffers (e.g. after receiving a large message) would eventually exhaust
+    /// available memory on less powerful devices when managing many peers.
     pub fn shrink_buffers(&mut self) {
-        self.rx_msg_buf.shrink_to(self.config.rx_buf_min_size);
-        self.tx_msg_buf.shrink_to(self.config.tx_buf_min_size);
+        fn shrink(v: &mut Vec<u8>, min: usize) {
+            if v.capacity() > min {
+                let shrink_to = (2 * v.capacity()) / 3;
+                v.shrink_to(min.max(shrink_to));
+            }
+        }
+        shrink(&mut self.rx_msg_buf, self.config.rx_buf_min_size);
+        shrink(&mut self.tx_msg_buf, self.config.tx_buf_min_size);
+        self.tx_queue_points.shrink();
     }
 
     /// Determines the interest set wanted by the connection.
@@ -308,6 +319,11 @@ mod queue_points {
         /// Returns the creation instant of the first queue point, if any.
         pub fn first(&self) -> Option<Instant> {
             self.0.first().map(|p| p.time)
+        }
+
+        /// Shrinks the capacity of the queue by 1/3, floored at 8 or current size.
+        pub fn shrink(&mut self) {
+            self.0.shrink_to(8.max((2 * self.0.capacity()) / 3));
         }
     }
 

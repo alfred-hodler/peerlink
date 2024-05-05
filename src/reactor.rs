@@ -3,9 +3,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use intmap::IntMap;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
+use nohash_hasher::IntMap;
 use slab::Slab;
 
 use crate::connector::{self, Connector, IntoTarget};
@@ -20,6 +20,9 @@ use async_channel::{Receiver, Sender};
 
 /// Token used for waking the reactor event loop.
 const WAKE_TOKEN: Token = Token(usize::MAX);
+
+/// MIO poll interval
+const POLL_INTERVAL: Option<Duration> = Some(Duration::from_secs(1));
 
 /// Command variants for the reactor to process.
 #[derive(Debug)]
@@ -304,13 +307,20 @@ where
 
     let mut connections: Slab<Connection<T>> = Slab::with_capacity(16);
     let mut events = Events::with_capacity(1024);
-    let mut read_buf = vec![0; 1024 * 1024];
     let mut last_maintenance = Instant::now();
-    let mut token_map: IntMap<Token> = IntMap::new();
+    let mut token_map: IntMap<u64, Token> = IntMap::default();
     let mut next_peer_id: u64 = 0;
 
+    let mut read_buf = Vec::with_capacity(config.receive_buffer_size);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        // this is a receive buffer where we never care about the part that was not filled,
+        // so having uninit memory is fine
+        read_buf.set_len(config.receive_buffer_size)
+    };
+
     loop {
-        poll.poll(&mut events, Some(Duration::from_secs(1)))?;
+        poll.poll(&mut events, POLL_INTERVAL)?;
 
         let now = Instant::now();
 
@@ -351,7 +361,7 @@ where
                             }
 
                             Command::Disconnect(peer) => {
-                                if token_map.contains_key(peer.0) {
+                                if token_map.contains_key(&peer.0) {
                                     let mut connection = remove_stream(
                                         poll.registry(),
                                         &mut connections,
@@ -374,7 +384,7 @@ where
                                 }
                             }
 
-                            Command::Message(peer, message) => match token_map.get(peer.0) {
+                            Command::Message(peer, message) => match token_map.get(&peer.0) {
                                 Some(token) => {
                                     let connection =
                                         connections.get_mut(token.0).expect("must exist here");
@@ -431,7 +441,7 @@ where
                                 )?;
                                 log::debug!("accepted connection from {addr}");
                             }
-                            Err(err) if would_block(&err) => break,
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                             Err(err) => log::debug!("accept error: {}", err),
                         }
                     }
@@ -594,7 +604,7 @@ where
                 }
 
                 if let State::Connected { id } = connection.state {
-                    token_map.remove(id.0);
+                    token_map.remove(&id.0);
                 }
             }
 
@@ -643,10 +653,10 @@ fn add_stream<T: IntoTarget>(
 fn remove_stream<T: IntoTarget>(
     registry: &Registry,
     connections: &mut Slab<Connection<T>>,
-    token_map: &mut IntMap<Token>,
+    token_map: &mut IntMap<u64, Token>,
     peer: PeerId,
 ) -> std::io::Result<Connection<T>> {
-    let token = token_map.remove(peer.0).expect("must exist here");
+    let token = token_map.remove(&peer.0).expect("must exist here");
 
     let mut connection = connections.remove(token.0);
 
@@ -708,12 +718,6 @@ fn is_listener(n_listeners: usize, token: Token) -> bool {
 #[inline(always)]
 fn has_slot(n_listeners: usize, next_key: usize) -> bool {
     next_key < usize::MAX - n_listeners
-}
-
-/// Checks if an IO error is of the "would block" variety.
-#[inline(always)]
-fn would_block(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::WouldBlock
 }
 
 #[cfg(not(feature = "async"))]
