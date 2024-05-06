@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -166,8 +167,8 @@ where
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
 
-        let (cmd_sender, cmd_receiver) = channel();
-        let (event_sender, event_receiver) = channel();
+        let (cmd_sender, cmd_receiver) = channel(None);
+        let (event_sender, event_receiver) = channel(config.receive_backpressure_control);
 
         let command_sender = Handle {
             sender: cmd_sender,
@@ -721,13 +722,21 @@ fn has_slot(n_listeners: usize, next_key: usize) -> bool {
 }
 
 #[cfg(not(feature = "async"))]
-fn channel<M>() -> (crossbeam_channel::Sender<M>, crossbeam_channel::Receiver<M>) {
-    crossbeam_channel::unbounded()
+fn channel<M>(
+    cap: Option<NonZeroUsize>,
+) -> (crossbeam_channel::Sender<M>, crossbeam_channel::Receiver<M>) {
+    match cap {
+        Some(cap) => crossbeam_channel::bounded(cap.into()),
+        None => crossbeam_channel::unbounded(),
+    }
 }
 
 #[cfg(feature = "async")]
-fn channel<M>() -> (async_channel::Sender<M>, async_channel::Receiver<M>) {
-    async_channel::unbounded()
+fn channel<M>(cap: Option<NonZeroUsize>) -> (async_channel::Sender<M>, async_channel::Receiver<M>) {
+    match cap {
+        Some(cap) => async_channel::bounded(cap.into()),
+        None => async_channel::unbounded(),
+    }
 }
 
 #[cfg(test)]

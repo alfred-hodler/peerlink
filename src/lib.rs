@@ -13,6 +13,8 @@ pub mod connector;
 mod message_stream;
 pub mod reactor;
 
+use std::num::NonZeroUsize;
+
 pub use message_stream::StreamConfig;
 pub use mio::net::TcpStream;
 pub use reactor::{Command, Event, Handle, Reactor};
@@ -35,6 +37,13 @@ pub struct Config {
     /// receive operation. Setting this too low can cause many reads to happen, whereas too high a
     /// figure will use up more memory. The default is 1 megabyte.
     pub receive_buffer_size: usize,
+    /// Whether the reactor should perform backpressure control on the receive side. Setting this
+    /// to `Some(n)` means that the reactor will start blocking on sending events to the consumer
+    /// when the receive channel of size `n` is full and events are not being read. Setting it to
+    /// `None` means that the capacity of the event channel is unbounded and the reactor will send
+    /// events to the consumer as fast as it can, regardless of whether those events are being read
+    /// (at all). The default is no backpressure control (`None`).
+    pub receive_backpressure_control: Option<NonZeroUsize>,
 }
 
 impl Default for Config {
@@ -43,6 +52,7 @@ impl Default for Config {
             bind_addr: Default::default(),
             stream_config: Default::default(),
             receive_buffer_size: 1024 * 1024,
+            receive_backpressure_control: None,
         }
     }
 }
