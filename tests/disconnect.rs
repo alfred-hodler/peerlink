@@ -10,37 +10,43 @@ use common::Message;
 // orderly, disorderly, and abrupt. In each instance, the remaining party must notice the
 // disconnect immediately and without fail.
 
+enum LeaveType {
+    Disconnect(PeerId),
+    Shutdown,
+    Panic,
+}
+
 #[test]
 fn client_orderly_disconnect() {
-    shutdown_test(8000, Command::Disconnect(PeerId(0)), true);
+    shutdown_test(8000, LeaveType::Disconnect(PeerId(0)), true);
 }
 
 #[test]
 fn client_shutdown_leave() {
-    shutdown_test(8001, Command::Shutdown, true);
+    shutdown_test(8001, LeaveType::Shutdown, true);
 }
 
 #[test]
 fn client_abrupt_leave() {
-    shutdown_test(8002, Command::Panic, true);
+    shutdown_test(8002, LeaveType::Panic, true);
 }
 
 #[test]
 fn server_orderly_disconnect() {
-    shutdown_test(8003, Command::Disconnect(PeerId(0)), false);
+    shutdown_test(8003, LeaveType::Disconnect(PeerId(0)), false);
 }
 
 #[test]
 fn server_shutdown_leave() {
-    shutdown_test(8004, Command::Shutdown, false);
+    shutdown_test(8004, LeaveType::Shutdown, false);
 }
 
 #[test]
 fn server_abrupt_leave() {
-    shutdown_test(8005, Command::Panic, false);
+    shutdown_test(8005, LeaveType::Panic, false);
 }
 
-fn shutdown_test(port: u16, shutdown_command: Command<Message, String>, client_is_leaving: bool) {
+fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool) {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
@@ -50,7 +56,7 @@ fn shutdown_test(port: u16, shutdown_command: Command<Message, String>, client_i
         ..Default::default()
     };
 
-    let (server_reactor, server_handle) = Reactor::new(config).unwrap();
+    let (server_reactor, server_handle) = Reactor::<_, Message, _>::new(config).unwrap();
     let (client_reactor, client_handle) = Reactor::new(Config::default()).unwrap();
 
     let _ = server_reactor.run();
@@ -82,7 +88,12 @@ fn shutdown_test(port: u16, shutdown_command: Command<Message, String>, client_i
         (server_handle, client_handle)
     };
 
-    leaving.send(shutdown_command).unwrap();
+    match shutdown_command {
+        LeaveType::Disconnect(peer_id) => leaving.send(Command::Disconnect(peer_id)),
+        LeaveType::Shutdown => leaving.shutdown(),
+        LeaveType::Panic => leaving.panic(),
+    }
+    .unwrap();
 
     assert!(matches!(
         remaining.receive_blocking().unwrap(),

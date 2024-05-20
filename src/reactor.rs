@@ -34,6 +34,13 @@ pub enum Command<M: Message, T: IntoTarget> {
     Disconnect(PeerId),
     /// Send a message to a peer.
     Message(PeerId, M),
+}
+
+/// System commands. Not for external use.
+#[derive(Debug)]
+enum SystemCommand<M: Message, T: IntoTarget> {
+    /// Various P2P commands.
+    P2P(Command<M, T>),
     /// Close all connections and shut down the reactor.
     Shutdown,
     /// Causes the event loop to panic. Only available in debug mode for integration testing.
@@ -113,7 +120,7 @@ where
     poll: Poll,
     config: Config,
     sender: EventSender<M, T>,
-    receiver: Receiver<Command<M, T>>,
+    receiver: Receiver<SystemCommand<M, T>>,
     connector: C,
     waker: Arc<Waker>,
     connect_tx: crossbeam_channel::Sender<ConnectResult<T>>,
@@ -201,7 +208,7 @@ where
 /// Provides bidirectional communication with a reactor. If this is dropped the reactor stops.
 pub struct Handle<M: Message, T: IntoTarget> {
     waker: Arc<Waker>,
-    sender: Sender<Command<M, T>>,
+    sender: Sender<SystemCommand<M, T>>,
     receiver: Receiver<Event<M, T>>,
 }
 
@@ -211,9 +218,9 @@ impl<M: Message, T: IntoTarget> Handle<M, T> {
     /// it is appropriate for use in async contexts.
     pub fn send(&self, command: Command<M, T>) -> io::Result<()> {
         #[cfg(not(feature = "async"))]
-        let result = self.sender.send(command);
+        let result = self.sender.send(SystemCommand::P2P(command));
         #[cfg(feature = "async")]
-        let result = self.sender.try_send(command);
+        let result = self.sender.try_send(SystemCommand::P2P(command));
 
         match result {
             Ok(()) => self.waker.wake(),
@@ -241,6 +248,39 @@ impl<M: Message, T: IntoTarget> Handle<M, T> {
     /// variety, depending on which feature is active.
     pub fn receiver(&self) -> &Receiver<Event<M, T>> {
         &self.receiver
+    }
+
+    /// Shuts down the reactor and consumes the handle. No further commands can be sent afterward.
+    pub fn shutdown(self) -> io::Result<()> {
+        #[cfg(not(feature = "async"))]
+        let result = self.sender.send(SystemCommand::Shutdown);
+        #[cfg(feature = "async")]
+        let result = self.sender.try_send(SystemCommand::Shutdown);
+
+        match result {
+            Ok(()) => self.waker.wake(),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "channel disconnected",
+            )),
+        }
+    }
+
+    /// Causes the reactor to panic. For testing only. No further commands can be sent afterward.
+    #[cfg(debug_assertions)]
+    pub fn panic(self) -> io::Result<()> {
+        #[cfg(not(feature = "async"))]
+        let result = self.sender.send(SystemCommand::Panic);
+        #[cfg(feature = "async")]
+        let result = self.sender.try_send(SystemCommand::Panic);
+
+        match result {
+            Ok(()) => self.waker.wake(),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "channel disconnected",
+            )),
+        }
     }
 }
 
@@ -357,11 +397,11 @@ where
                         log::trace!("command: {:?}", cmd);
 
                         match cmd {
-                            Command::Connect(target) => {
+                            SystemCommand::P2P(Command::Connect(target)) => {
                                 initiate_connect(&connector, target, &waker, &connect_tx);
                             }
 
-                            Command::Disconnect(peer) => {
+                            SystemCommand::P2P(Command::Disconnect(peer)) => {
                                 if token_map.contains_key(&peer.0) {
                                     let mut connection = remove_stream(
                                         poll.registry(),
@@ -385,32 +425,42 @@ where
                                 }
                             }
 
-                            Command::Message(peer, message) => match token_map.get(&peer.0) {
-                                Some(token) => {
-                                    let connection =
-                                        connections.get_mut(token.0).expect("must exist here");
+                            SystemCommand::P2P(Command::Message(peer, message)) => {
+                                match token_map.get(&peer.0) {
+                                    Some(token) => {
+                                        let connection =
+                                            connections.get_mut(token.0).expect("must exist here");
 
-                                    if connection.stream.queue_message(&message) {
-                                        poll.registry().reregister(
-                                            connection.stream.as_source(),
-                                            *token,
-                                            Interest::READABLE | Interest::WRITABLE,
-                                        )?;
-                                    } else {
-                                        sender.send(Event::SendBufferFull { peer, message });
-                                        log::debug!("message: send buffer for peer {peer} is full");
+                                        if connection.stream.queue_message(&message) {
+                                            poll.registry().reregister(
+                                                connection.stream.as_source(),
+                                                *token,
+                                                Interest::READABLE | Interest::WRITABLE,
+                                            )?;
+                                        } else {
+                                            sender.send(Event::SendBufferFull { peer, message });
+                                            log::debug!(
+                                                "message: send buffer for peer {peer} is full"
+                                            );
+                                        }
+                                    }
+
+                                    None => {
+                                        sender.send(Event::NoPeer(peer));
+                                        log::warn!("message: peer {peer} not found");
                                     }
                                 }
+                            }
 
-                                None => {
-                                    sender.send(Event::NoPeer(peer));
-                                    log::warn!("message: peer {peer} not found");
-                                }
-                            },
-
-                            Command::Shutdown => {
+                            SystemCommand::Shutdown => {
                                 for (id, mut connection) in connections {
                                     let _ = connection.stream.write(now);
+                                    if connection
+                                        .stream
+                                        .is_write_stale(now + Duration::from_secs(3600))
+                                    {
+                                        log::debug!("shutdown: connection had unsent data");
+                                    }
                                     let r = connection.stream.shutdown();
 
                                     log::debug!("shutdown: stream {}: {:?}", id, r);
@@ -420,7 +470,7 @@ where
                             }
 
                             #[cfg(debug_assertions)]
-                            Command::Panic => panic!("panic command received"),
+                            SystemCommand::Panic => panic!("panic command received"),
                         }
                     }
                 }
