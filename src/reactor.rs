@@ -793,7 +793,7 @@ fn channel<M>(cap: Option<NonZeroUsize>) -> (async_channel::Sender<M>, async_cha
 mod test {
     #[test]
     fn is_listener() {
-        use super::{is_listener, WAKE_TOKEN};
+        use super::{WAKE_TOKEN, is_listener};
         use mio::Token;
 
         assert!(!is_listener(0, WAKE_TOKEN));

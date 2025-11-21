@@ -103,7 +103,7 @@ impl<T: Read + Write> MessageStream<T> {
                                     }
                                     Err(DecodeError::NotEnoughData) => break 'decode,
                                     Err(DecodeError::MalformedMessage) => {
-                                        break 'read Err(ReadError::MalformedMessage)
+                                        break 'read Err(ReadError::MalformedMessage);
                                     }
                                 }
                             } else {
