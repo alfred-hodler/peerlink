@@ -114,7 +114,7 @@ fn many_to_one_interleaved() {
             client_reactor.run();
 
             let (client_peer, _) = connect(&client, &server, server_addr.to_string());
-            assert_eq!(i as u64, client_peer.0);
+            assert_eq!(i as u64, client_peer.inner());
 
             client
         })
@@ -122,9 +122,9 @@ fn many_to_one_interleaved() {
 
     for nonce in 0..100 {
         for (i, c) in clients.iter().enumerate() {
-            message(c, PeerId(0), Message::Ping(nonce));
+            message(c, PeerId::set_raw(0), Message::Ping(nonce));
             let ping_from_peer = expect_ping(server.receive_blocking().unwrap(), nonce);
-            assert_eq!(ping_from_peer, PeerId(i as u64));
+            assert_eq!(ping_from_peer, PeerId::set_raw(i as u64));
             message(&server, ping_from_peer, Message::Pong(nonce));
             expect_pong(c.receive_blocking().unwrap(), nonce);
         }
@@ -161,7 +161,7 @@ fn many_to_one_bulk() {
             client_reactor.run();
 
             let (client_peer, _) = connect(&client, &server, server_addr.to_string());
-            assert_eq!(i as u64, client_peer.0);
+            assert_eq!(i as u64, client_peer.inner());
 
             client
         })
@@ -169,7 +169,7 @@ fn many_to_one_bulk() {
 
     for nonce in 0..n_pings {
         for c in &clients {
-            message(c, PeerId(0), Message::Ping(nonce));
+            message(c, PeerId::set_raw(0), Message::Ping(nonce));
         }
     }
 
@@ -241,9 +241,9 @@ fn peer_id_increments() {
         client_reactor.run();
 
         let (client_peer, _) = connect(&client, &server, server_addr.to_string());
-        assert_eq!(i as u64, client_peer.0);
+        assert_eq!(i as u64, client_peer.inner());
 
-        let client_that_left = disconnect(&client, &server, PeerId(0));
+        let client_that_left = disconnect(&client, &server, PeerId::set_raw(0));
         assert_eq!(client_that_left, client_peer);
     }
 }

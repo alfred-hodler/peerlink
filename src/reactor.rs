@@ -349,15 +349,15 @@ where
     let mut connections: Slab<Connection<T>> = Slab::with_capacity(16);
     let mut events = Events::with_capacity(1024);
     let mut last_maintenance = Instant::now();
-    let mut token_map: IntMap<u64, Token> = IntMap::default();
-    let mut next_peer_id: u64 = 0;
+    let mut token_map: IntMap<PeerId, Token> = IntMap::default();
+    let mut next_peer_id = PeerId(0);
 
     let mut read_buf = Vec::with_capacity(config.receive_buffer_size);
     #[allow(clippy::uninit_vec)]
     unsafe {
         // this is a receive buffer where we never care about the part that was not filled,
         // so having uninit memory is fine
-        read_buf.set_len(config.receive_buffer_size)
+        read_buf.set_len(config.receive_buffer_size);
     };
 
     loop {
@@ -402,7 +402,7 @@ where
                             }
 
                             SystemCommand::P2P(Command::Disconnect(peer)) => {
-                                if token_map.contains_key(&peer.0) {
+                                if token_map.contains_key(&peer) {
                                     let mut connection = remove_stream(
                                         poll.registry(),
                                         &mut connections,
@@ -426,10 +426,11 @@ where
                             }
 
                             SystemCommand::P2P(Command::Message(peer, message)) => {
-                                match token_map.get(&peer.0) {
+                                match token_map.get(&peer) {
                                     Some(token) => {
-                                        let connection =
-                                            connections.get_mut(token.0).expect("must exist here");
+                                        let connection = connections
+                                            .get_mut(token.0)
+                                            .expect("token->connection must exist here");
 
                                         if connection.stream.queue_message(&message) {
                                             poll.registry().reregister(
@@ -461,9 +462,9 @@ where
                                     {
                                         log::debug!("shutdown: connection had unsent data");
                                     }
-                                    let r = connection.stream.shutdown();
+                                    let shutdown_result = connection.stream.shutdown();
 
-                                    log::debug!("shutdown: stream {}: {:?}", id, r);
+                                    log::debug!("shutdown: stream {}: {:?}", id, shutdown_result);
                                 }
 
                                 return Ok(());
@@ -508,10 +509,10 @@ where
                             } else {
                                 log::debug!("stream ready: {:?}", connection.direction);
 
-                                let peer = PeerId(next_peer_id);
-                                let prev_mapping = token_map.insert(peer.0, token);
+                                let peer = next_peer_id;
+                                let prev_mapping = token_map.insert(peer, token);
                                 assert!(prev_mapping.is_none());
-                                next_peer_id += 1;
+                                next_peer_id = next_peer_id.next();
 
                                 connection.state = State::Connected { id: peer };
 
@@ -616,7 +617,7 @@ where
         }
 
         // if we get an error during deregistration, the reactor must terminate
-        let mut deregister_error = None;
+        let mut deregister_error = Ok(());
 
         // dead stream removal
         connections.retain(|_, connection| {
@@ -651,23 +652,22 @@ where
 
             if !retain {
                 if let Err(err) = poll.registry().deregister(connection.stream.as_source()) {
-                    let _ = deregister_error.insert(err);
+                    deregister_error = Err(err);
                 }
 
                 if let State::Connected { id } = connection.state {
-                    token_map.remove(&id.0);
+                    token_map.remove(&id);
                 }
             }
 
             retain
         });
 
-        if let Some(err) = deregister_error {
-            return Err(err);
-        }
+        deregister_error?;
 
-        // periodic buffer resize
+        // periodic maintenance
         if (now - last_maintenance).as_secs() > 30 {
+            // buffer resize
             for (_, connection) in &mut connections {
                 connection.stream.shrink_buffers();
             }
@@ -685,11 +685,11 @@ fn add_stream<T: IntoTarget>(
     mut stream: TcpStream,
     stream_cfg: message_stream::StreamConfig,
 ) -> std::io::Result<()> {
-    let token = Token(connections.vacant_key());
+    let vacancy = connections.vacant_entry();
 
-    registry.register(&mut stream, token, Interest::WRITABLE)?;
+    registry.register(&mut stream, Token(vacancy.key()), Interest::WRITABLE)?;
 
-    connections.insert(Connection {
+    vacancy.insert(Connection {
         stream: MessageStream::new(stream, stream_cfg),
         direction,
         state: State::Connecting {
@@ -704,10 +704,12 @@ fn add_stream<T: IntoTarget>(
 fn remove_stream<T: IntoTarget>(
     registry: &Registry,
     connections: &mut Slab<Connection<T>>,
-    token_map: &mut IntMap<u64, Token>,
+    token_map: &mut IntMap<PeerId, Token>,
     peer: PeerId,
 ) -> std::io::Result<Connection<T>> {
-    let token = token_map.remove(&peer.0).expect("must exist here");
+    let token = token_map
+        .remove(&peer)
+        .expect("peer->token must exist at deregistration");
 
     let mut connection = connections.remove(token.0);
 

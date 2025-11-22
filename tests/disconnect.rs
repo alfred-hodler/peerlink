@@ -18,7 +18,7 @@ enum LeaveType {
 
 #[test]
 fn client_orderly_disconnect() {
-    shutdown_test(8000, LeaveType::Disconnect(PeerId(0)), true);
+    shutdown_test(8000, LeaveType::Disconnect(PeerId::set_raw(0)), true);
 }
 
 #[test]
@@ -33,7 +33,7 @@ fn client_abrupt_leave() {
 
 #[test]
 fn server_orderly_disconnect() {
-    shutdown_test(8003, LeaveType::Disconnect(PeerId(0)), false);
+    shutdown_test(8003, LeaveType::Disconnect(PeerId::set_raw(0)), false);
 }
 
 #[test]

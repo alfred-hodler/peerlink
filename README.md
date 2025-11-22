@@ -16,7 +16,7 @@
 - Simple usage (see [examples](examples)).
 - First class support for **proxying** (Socks5, Tor...)
 - **Efficient:** low latency operations based on nonblocking IO.
-- **Safe:** written in Rust.
+- **Memory safe:** written in Rust.
 
 ## Proxying
 

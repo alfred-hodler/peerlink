@@ -26,7 +26,7 @@ pub use crossbeam_channel;
 pub use async_channel;
 
 /// Configuration parameters for the reactor.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// The list of socket addresses where the reactor listens for inbound connections.
     pub bind_addr: Vec<std::net::SocketAddr>,
@@ -94,10 +94,32 @@ pub enum DecodeError {
 /// incrementing for each new connection. Even if the same peer (in terms of socket address)
 /// connects multiple times, a new `PeerId` instance will be issued for each connection.
 #[derive(Debug, Clone, Hash, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PeerId(pub u64);
+pub struct PeerId(u64);
+
+impl PeerId {
+    /// DANGER: allows the user to set peer ids directly. Normally these are assigned by the
+    /// reactor and the consumer of the library should not be creating them manually. For
+    /// development/testing/debugging purposes only. Use only if you really know what you
+    /// are doing.
+    pub fn set_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the next id in sequence (self + 1).
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// Returns the inner id of the peer id.
+    pub fn inner(&self) -> u64 {
+        self.0
+    }
+}
 
 impl std::fmt::Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
+
+impl nohash_hasher::IsEnabled for PeerId {}
