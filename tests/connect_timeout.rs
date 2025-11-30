@@ -1,8 +1,7 @@
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::Duration;
 
-use peerlink::{Config, Event, Reactor, StreamConfig};
+use peerlink::{Config, Event, Reactor};
 
 mod common;
 use common::Message;
@@ -12,14 +11,8 @@ use common::Message;
 fn client_connects_to_nonexistent() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (client_reactor, client_handle) = Reactor::<_, Message, String>::new(Config {
-        stream_config: StreamConfig {
-            stream_connect_timeout: Duration::from_secs(1),
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .unwrap();
+    let (client_reactor, client_handle) =
+        Reactor::<_, Message, String>::new(Config::default()).unwrap();
 
     let _ = client_reactor.run();
 
@@ -30,6 +23,6 @@ fn client_connects_to_nonexistent() {
     let connected: Event<_, _> = client_handle.receive_blocking().unwrap();
     assert!(matches!(
         connected,
-        Event::ConnectedTo { result: Err(err), .. } if err.kind() == ErrorKind::TimedOut
+        Event::ConnectedTo { result: Err(err), .. } if err.kind() == ErrorKind::ConnectionRefused
     ));
 }

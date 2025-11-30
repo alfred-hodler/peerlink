@@ -9,27 +9,22 @@ pub enum Target {
     Domain(String, u16),
 }
 
-/// Describes a type that can be converted into a connect target (`Target`).
+/// Describes a type that can be converted into a connect target ([`Target`]).
 pub trait IntoTarget: Sync + Send + std::fmt::Debug + Clone + 'static {
-    /// Returns `Some` if the conversion was successful, `None` otherwise.
+    /// Returns [`Some`] if the conversion was successful, [`None`] otherwise.
     fn target(&self) -> Option<Target>;
 }
 
 impl IntoTarget for String {
     fn target(&self) -> Option<Target> {
-        if let Ok(socket) = self.parse::<SocketAddrV4>() {
-            return Some(Target::Socket(socket.into()));
+        if let Ok(socket) = self.parse::<SocketAddr>() {
+            Some(Target::Socket(socket))
+        } else {
+            let (domain, port) = self.trim().split_once(':')?;
+            let port: u16 = port.parse().ok()?;
+
+            Some(Target::Domain(domain.to_owned(), port))
         }
-
-        if let Ok(socket) = self.parse::<SocketAddrV6>() {
-            return Some(Target::Socket(socket.into()));
-        }
-
-        let (domain, port) = self.trim().split_once(':')?;
-
-        let port: u16 = port.parse().ok()?;
-
-        Some(Target::Domain(domain.to_owned(), port))
     }
 }
 
@@ -52,7 +47,7 @@ impl IntoTarget for SocketAddrV6 {
 }
 
 /// Types implementing this trait can connect to a target address in a custom manner before
-/// returning a `mio::net::TcpStream`. This can be used for proxying and other custom scenarios.
+/// returning a [`mio::net::TcpStream`]. This can be used for proxying and other custom scenarios.
 /// It is the responsibility of the caller to put the stream into nonblocking mode. Failing
 /// to do so will block the reactor indefinitely and render it inoperable.
 pub trait Connector: Clone + Send + Sync + 'static {
@@ -63,11 +58,11 @@ pub trait Connector: Clone + Send + Sync + 'static {
     /// reactor.
     const CONNECT_IN_BACKGROUND: bool;
 
-    /// Connect to a target address and return a `mio` TCP stream.
+    /// Connect to a target address and return a [`mio`] TCP stream.
     fn connect(&self, target: &impl IntoTarget) -> io::Result<mio::net::TcpStream>;
 }
 
-/// Default `Connector` implementation for `mio` that just connects to a target address.
+/// Default [`Connector`] implementation for [`mio`] that just connects to a target address.
 #[derive(Clone)]
 pub struct DefaultConnector;
 

@@ -2,8 +2,8 @@ use core::panic;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::thread::JoinHandle;
 
-use peerlink::reactor::{DisconnectReason, Handle};
-use peerlink::{Command, Config, Event, PeerId, Reactor};
+use peerlink::reactor::Handle;
+use peerlink::{Command, Config, DisconnectReason, Event, PeerId, Reactor};
 
 mod common;
 use common::Message;
@@ -272,12 +272,6 @@ fn start_server_client(server_port: u16) -> Scaffold {
 
     let server_join_handle = server_reactor.run();
     let client_join_handle = client_reactor.run();
-
-    // We are using this because there is a split-second moment between the server binding to a local
-    // socket and registering it for polling where it can miss notifications. This will never
-    // happen in practice but it is essentially a race condition that can deadlock a test if the
-    // running machine is fast enough.
-    std::thread::sleep(std::time::Duration::from_millis(10));
 
     Scaffold {
         server: server_handle,

@@ -1,7 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use peerlink::reactor::DisconnectReason;
-use peerlink::{Command, Config, Event, PeerId, Reactor};
+use peerlink::{Command, Config, DisconnectReason, Event, PeerId, Reactor};
 
 mod common;
 use common::Message;

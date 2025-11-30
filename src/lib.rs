@@ -9,21 +9,24 @@
 //!
 //! See the included example for usage.
 
-pub mod connector;
 mod message_stream;
+
+pub mod connector;
 pub mod reactor;
 
-use std::num::NonZeroUsize;
+use std::{io, net::SocketAddr, num::NonZeroUsize};
 
 pub use message_stream::StreamConfig;
 pub use mio::net::TcpStream;
-pub use reactor::{Command, Event, Handle, Reactor};
+pub use reactor::{Handle, Reactor};
 
 #[cfg(not(feature = "async"))]
 pub use crossbeam_channel;
 
 #[cfg(feature = "async")]
 pub use async_channel;
+
+use crate::connector::IntoTarget;
 
 /// Configuration parameters for the reactor.
 #[derive(Debug, Clone)]
@@ -63,7 +66,7 @@ pub trait Message: std::fmt::Debug + Sized + Send + Sync + 'static {
     /// no need to handle the error path.
     ///
     /// Returns the number of encoded bytes.
-    fn encode(&self, dest: &mut impl std::io::Write) -> usize;
+    fn encode(&self, sink: &mut impl std::io::Write) -> usize;
 
     /// Provides access to the underlying read buffer. The buffer may contain any number of
     /// messages, including no messages at all or only a partial message. If there are enough bytes
@@ -122,4 +125,74 @@ impl std::fmt::Display for PeerId {
     }
 }
 
-impl nohash_hasher::IsEnabled for PeerId {}
+/// Command variants for the reactor to process.
+#[derive(Debug)]
+pub enum Command<M: Message, T: IntoTarget> {
+    /// Connect to a remote host.
+    Connect(T),
+    /// Disconnect from a peer.
+    Disconnect(PeerId),
+    /// Send a message to a peer.
+    Message(PeerId, M),
+}
+
+// Event variants produced by the reactor.
+#[derive(Debug)]
+pub enum Event<M: Message, T: IntoTarget> {
+    /// The reactor attempted to connect to a remote peer.
+    ConnectedTo {
+        /// The remote host that was connected to. This is in the same format it was specified.
+        target: T,
+        /// The result of the connection attempt. A peer id is returned if successful.
+        result: io::Result<PeerId>,
+    },
+    /// The reactor received a connection from a remote peer.
+    ConnectedFrom {
+        /// The peer associated with the event.
+        peer: PeerId,
+        /// The address of the remote peer.
+        addr: SocketAddr,
+        /// The address of the local interface that accepted the connection.
+        interface: SocketAddr,
+    },
+    /// A peer disconnected.
+    Disconnected {
+        /// The peer associated with the event.
+        peer: PeerId,
+        /// The reason the peer left.
+        reason: DisconnectReason,
+    },
+    /// A peer produced a message.
+    Message {
+        /// The peer associated with the event.
+        peer: PeerId,
+        /// The message received from the peer.
+        message: M,
+    },
+    /// No peer exists with the specified id. Sent when an operation was specified using a peer id
+    /// that is not present in the reactor.
+    NoPeer(PeerId),
+    /// The send buffer associated with the peer is full. It means the peer is probably not
+    /// reading data from the wire in a timely manner.
+    SendBufferFull {
+        /// The peer associated with the event.
+        peer: PeerId,
+        /// The message that could not be sent to the peer.
+        message: M,
+    },
+}
+
+/// Explains why a client connection was disconnected.
+#[derive(Debug)]
+pub enum DisconnectReason {
+    /// The reactor was asked to perform a disconnect.
+    Requested,
+    /// The peer left and the end of stream was reached.
+    Left,
+    /// The peer violated the protocol in some way, usually by sending a malformed message.
+    CodecViolation,
+    /// The write side is stale, i.e. the peer is not reading the data we are sending.
+    WriteStale,
+    /// An IO error occurred.
+    Error(io::Error),
+}

@@ -1,5 +1,4 @@
-use peerlink::reactor::Event;
-use peerlink::{Command, Config, Reactor};
+use peerlink::{Command, Config, Event, Reactor};
 
 // This example consists of a client and server. The server waits for inbound connections from
 // clients and replies to client pings with pongs.

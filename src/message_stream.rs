@@ -80,76 +80,97 @@ impl<T: Read + Write> MessageStream<T> {
         }
     }
 
-    /// Receives as many messages as possible, either until reads would start blocking, or until
-    /// an error is encountered. Encountering an error means that the stream should be discarded.
+    // TODO document
+    /// Encountering an error means that the stream should be discarded.
+    /// Attempts to read from a connection and decode messages in a fair manner.
+    #[must_use]
     pub fn read<M: Message, F: Fn(M)>(
         &mut self,
         rx_buf: &mut [u8],
         on_msg: F,
-    ) -> Result<(), ReadError> {
-        'read: loop {
-            match self.stream.read(rx_buf).map(|read| &rx_buf[..read]) {
-                Ok(&[]) => break 'read Err(ReadError::EndOfStream),
+    ) -> Result<bool, ReadError> {
+        // NOTE: `true` means "maybe there is more"
 
-                Ok(received) => {
-                    if !self.rx_msg_buf.is_empty() {
-                        self.rx_msg_buf.extend_from_slice(received);
-                        'decode: loop {
-                            if !self.rx_msg_buf.is_empty() {
-                                match M::decode(&self.rx_msg_buf) {
-                                    Ok((message, consumed)) => {
-                                        self.rx_msg_buf.drain(..consumed);
-                                        on_msg(message);
-                                    }
-                                    Err(DecodeError::NotEnoughData) => break 'decode,
-                                    Err(DecodeError::MalformedMessage) => {
-                                        break 'read Err(ReadError::MalformedMessage);
-                                    }
-                                }
-                            } else {
-                                break 'decode;
-                            }
-                        }
-                    } else {
-                        let mut next_from = 0;
-                        'decode: loop {
-                            let next = &received[next_from..];
-                            if !next.is_empty() {
-                                match M::decode(next) {
-                                    Ok((message, consumed)) => {
-                                        on_msg(message);
-                                        next_from += consumed;
-                                    }
-                                    Err(DecodeError::NotEnoughData) => {
-                                        if self.rx_msg_buf.capacity() == 0 {
-                                            self.rx_msg_buf
-                                                .reserve_exact(self.config.rx_buf_min_size);
-                                        }
-                                        self.rx_msg_buf.extend_from_slice(next);
-                                        break 'decode;
-                                    }
-                                    Err(DecodeError::MalformedMessage) => {
-                                        break 'read Err(ReadError::MalformedMessage);
-                                    }
-                                }
-                            } else {
-                                break 'decode;
-                            }
-                        }
+        let mut total_read: usize = 0;
+        let read_result = loop {
+            match self.stream.read(&mut rx_buf[total_read..]) {
+                Ok(0) => break Err(ReadError::EndOfStream),
+                Ok(read @ 1..) => {
+                    total_read += read;
+                    if total_read == rx_buf.len() {
+                        // exceeded, maybe there is more but we need to move on
+                        break Ok(true);
                     }
                 }
-
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break 'read Ok(()),
-
-                Err(err) => break 'read Err(ReadError::Error(err)),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break Ok(false),
+                Err(err) => break Err(ReadError::Error(err)),
             }
+        };
+
+        let decode_result = if self.rx_msg_buf.is_empty() {
+            // no preexisting bytes in the buffer
+            let mut cursor: usize = 0;
+            let buffer = &rx_buf[..total_read];
+
+            loop {
+                match M::decode(&buffer[cursor..]) {
+                    Ok((message, consumed)) => {
+                        cursor += consumed;
+                        on_msg(message);
+                    }
+                    Err(DecodeError::NotEnoughData) => {
+                        if self.rx_msg_buf.capacity() == 0 {
+                            self.rx_msg_buf.reserve_exact(self.config.rx_buf_min_size);
+                        }
+                        self.rx_msg_buf.extend_from_slice(&buffer[cursor..]);
+                        break Ok(false); // not ready in the next round as far as we know
+                    }
+                    Err(DecodeError::MalformedMessage) => {
+                        break Err(ReadError::MalformedMessage);
+                    }
+                }
+            }
+        } else {
+            // there are preexisting bytes in the buffer
+            let mut cursor: usize = 0;
+            self.rx_msg_buf.extend_from_slice(&rx_buf[..total_read]);
+            let buffer = &self.rx_msg_buf;
+
+            let result = loop {
+                match M::decode(&buffer[cursor..]) {
+                    Ok((message, consumed)) => {
+                        cursor += consumed;
+                        on_msg(message);
+                    }
+                    Err(DecodeError::NotEnoughData) => {
+                        break Ok(false); // not ready in the next round as far as we know
+                    }
+                    Err(DecodeError::MalformedMessage) => {
+                        break Err(ReadError::MalformedMessage);
+                    }
+                }
+            };
+            self.rx_msg_buf.drain(..cursor);
+            result
+        };
+
+        if let Err(err) = read_result {
+            return Err(err);
+        }
+
+        match (read_result, decode_result) {
+            (Ok(read), Ok(decode)) => Ok(read || decode),
+            (Ok(_), Err(err)) | (Err(err), Ok(_)) => Err(err),
+            (Err(err), Err(_)) => Err(err),
         }
     }
 
     /// Writes out as many bytes from the send buffer as possible, until blocking would start.
-    pub fn write(&mut self, now: Instant) -> io::Result<()> {
+    /// Returns `true` if more data is queued, `false` otherwise.
+    #[must_use]
+    pub fn write(&mut self, now: Instant) -> io::Result<bool> {
         if !self.has_queued_data() {
-            return Ok(());
+            return Ok(false);
         }
 
         loop {
@@ -159,13 +180,13 @@ impl<T: Read + Write> MessageStream<T> {
                     log::trace!("wrote out {written} bytes, has more: {}", has_more);
 
                     if !has_more {
-                        break Ok(());
+                        break Ok(false);
                     }
                 }
 
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     log::trace!("write would block");
-                    break Ok(());
+                    break Ok(self.has_queued_data());
                 }
 
                 Err(err) => break Err(err),
@@ -220,15 +241,6 @@ impl<T: Read + Write> MessageStream<T> {
         self.tx_queue_points.shrink();
     }
 
-    /// Determines the interest set wanted by the connection.
-    pub fn interest(&self) -> mio::Interest {
-        if self.has_queued_data() {
-            mio::Interest::READABLE | mio::Interest::WRITABLE
-        } else {
-            mio::Interest::READABLE
-        }
-    }
-
     /// Takes some bytes from the local send buffer and sends them. Removes successfully sent bytes
     /// from the buffer. Returns the number of bytes sent.
     fn attempt_write(&mut self, now: Instant) -> io::Result<usize> {
@@ -261,6 +273,10 @@ impl MessageStream<mio::net::TcpStream> {
         self.stream.shutdown(std::net::Shutdown::Both)
     }
 
+    pub fn take_error(&self) -> Option<io::Error> {
+        self.stream.take_error().ok().flatten()
+    }
+
     /// Returns the underlying stream as a Mio event source.
     pub fn as_source(&mut self) -> &mut impl mio::event::Source {
         &mut self.stream
@@ -271,6 +287,7 @@ impl MessageStream<mio::net::TcpStream> {
 /// This allows the consumer to track how long ago a message was attempted to be sent out and how
 /// many bytes are yet to be sent.
 mod queue_points {
+    use std::collections::VecDeque;
     use std::time::Instant;
 
     /// A single queue point given a point in time and the remaining number of bytes.
@@ -282,7 +299,7 @@ mod queue_points {
 
     /// A list of queue points, from oldest to newest.
     #[derive(Debug, Default)]
-    pub struct Queue(Vec<Point>);
+    pub struct Queue(VecDeque<Point>);
 
     impl Queue {
         /// Signals to the current queue point that a number of bytes were written out.
@@ -310,7 +327,7 @@ mod queue_points {
 
         /// Appends a new queue point of a certain size.
         pub fn append(&mut self, size: usize) {
-            self.0.push(Point {
+            self.0.push_back(Point {
                 time: Instant::now(),
                 left: size,
             })
@@ -318,7 +335,7 @@ mod queue_points {
 
         /// Returns the creation instant of the first queue point, if any.
         pub fn first(&self) -> Option<Instant> {
-            self.0.first().map(|p| p.time)
+            self.0.front().map(|p| p.time)
         }
 
         /// Shrinks the capacity of the queue by 1/3, floored at 8 or current size.
