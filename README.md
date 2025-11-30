@@ -28,8 +28,8 @@ By default the reactor exposes a blocking handle. To use this in async contexts,
 
 ## Usage
 
-Please refer to the documentation or the supplied [examples](examples) and [integration tests](tests).
+Refer to the documentation or the supplied [examples](examples) and [integration tests](tests).
 
 ## Disclaimer
 
-This project comes with no warranty whatsoever. Please refer to the license for details.
+This project comes with no warranty whatsoever. Refer to the license for details.

@@ -18,6 +18,8 @@ impl Message {
 }
 
 impl peerlink::Message for Message {
+    const MAX_SIZE: usize = 1024 * 1024 * 10 + 8;
+
     fn encode(&self, dest: &mut impl std::io::Write) -> usize {
         let mut written = 0;
 
