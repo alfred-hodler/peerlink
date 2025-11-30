@@ -1,7 +1,6 @@
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::Ipv4Addr;
 
-use peerlink::reactor::DisconnectReason;
-use peerlink::{Command, Config, Event, PeerId, Reactor};
+use peerlink::{Command, Config, DisconnectReason, Event, PeerId};
 
 mod common;
 use common::Message;
@@ -49,18 +48,15 @@ fn server_abrupt_leave() {
 fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool) {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
+    let server_addr = (Ipv4Addr::LOCALHOST, port);
 
     let config = Config {
-        bind_addr: vec![server_addr],
+        bind_addr: vec![server_addr.into()],
         ..Default::default()
     };
 
-    let (server_reactor, server_handle) = Reactor::<_, Message, _>::new(config).unwrap();
-    let (client_reactor, client_handle) = Reactor::new(Config::default()).unwrap();
-
-    let _ = server_reactor.run();
-    let _ = client_reactor.run();
+    let server_handle = peerlink::run::<Message>(config).unwrap();
+    let client_handle = peerlink::run(Config::default()).unwrap();
 
     // We are using this because there is a split-second moment between the server binding to a local
     // socket and registering it for polling where it can miss notifications. This will never
@@ -68,9 +64,7 @@ fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool
     // running machine is fast enough.
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    client_handle
-        .send(Command::Connect(server_addr.to_string()))
-        .unwrap();
+    client_handle.send(Command::connect(server_addr)).unwrap();
 
     assert!(matches!(
         client_handle.receive_blocking().unwrap(),
@@ -89,11 +83,16 @@ fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool
     };
 
     match shutdown_command {
-        LeaveType::Disconnect(peer_id) => leaving.send(Command::Disconnect(peer_id)),
-        LeaveType::Shutdown => leaving.shutdown(),
-        LeaveType::Panic => leaving.panic(),
+        LeaveType::Disconnect(peer_id) => {
+            leaving.send(Command::Disconnect(peer_id)).unwrap();
+        }
+        LeaveType::Shutdown => {
+            leaving.shutdown().unwrap();
+        }
+        LeaveType::Panic => {
+            leaving.panic().unwrap();
+        }
     }
-    .unwrap();
 
     assert!(matches!(
         remaining.receive_blocking().unwrap(),

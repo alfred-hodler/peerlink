@@ -2,16 +2,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Registry, Token, Waker};
-use nohash_hasher::IntMap;
-use slab::Slab;
+use mio::net::TcpListener;
+use mio::{Interest, Poll, Token, Waker};
 
-use crate::connector::{self, Connector, IntoTarget};
-use crate::message_stream::{self, MessageStream};
-use crate::{Config, Message, PeerId};
+use crate::connector::{self, Connector, Target};
+use crate::{Command, Config, DisconnectReason, Event, Message, message_stream};
 
 #[cfg(not(feature = "async"))]
 use crossbeam_channel::{Receiver, Sender};
@@ -19,204 +16,55 @@ use crossbeam_channel::{Receiver, Sender};
 #[cfg(feature = "async")]
 use async_channel::{Receiver, Sender};
 
-/// Token used for waking the reactor event loop.
-const WAKE_TOKEN: Token = Token(usize::MAX);
+mod connection;
+mod scheduler;
 
-/// MIO poll interval
-const POLL_INTERVAL: Option<Duration> = Some(Duration::from_secs(1));
-
-/// Command variants for the reactor to process.
-#[derive(Debug)]
-pub enum Command<M: Message, T: IntoTarget> {
-    /// Connect to a remote host.
-    Connect(T),
-    /// Disconnect from a peer.
-    Disconnect(PeerId),
-    /// Send a message to a peer.
-    Message(PeerId, M),
+/// Runs a new reactor using some config and the default connector.
+pub fn run<M: Message>(config: Config) -> std::io::Result<Handle<M>> {
+    let (reactor, handle) = Reactor::new(config)?;
+    let join_handle = reactor.run();
+    Ok(handle.into_running(join_handle))
 }
 
-/// System commands. Not for external use.
-#[derive(Debug)]
-enum SystemCommand<M: Message, T: IntoTarget> {
-    /// Various P2P commands.
-    P2P(Command<M, T>),
-    /// Close all connections and shut down the reactor.
-    Shutdown,
-    /// Causes the event loop to panic. Only available in debug mode for integration testing.
-    #[cfg(debug_assertions)]
-    Panic,
-}
-
-// Event variants produced by the reactor.
-#[derive(Debug)]
-pub enum Event<M: Message, T: IntoTarget> {
-    /// The reactor attempted to connect to a remote peer.
-    ConnectedTo {
-        /// The remote host that was connected to. This is in the same format it was specified.
-        target: T,
-        /// The result of the connection attempt. A peer id is returned if successful.
-        result: io::Result<PeerId>,
-    },
-    /// The reactor received a connection from a remote peer.
-    ConnectedFrom {
-        /// The peer associated with the event.
-        peer: PeerId,
-        /// The address of the remote peer.
-        addr: SocketAddr,
-        /// The address of the local interface that accepted the connection.
-        interface: SocketAddr,
-    },
-    /// A peer disconnected.
-    Disconnected {
-        /// The peer associated with the event.
-        peer: PeerId,
-        /// The reason the peer left.
-        reason: DisconnectReason,
-    },
-    /// A peer produced a message.
-    Message {
-        /// The peer associated with the event.
-        peer: PeerId,
-        /// The message received from the peer.
-        message: M,
-    },
-    /// No peer exists with the specified id. Sent when an operation was specified using a peer id
-    /// that is not present in the reactor.
-    NoPeer(PeerId),
-    /// The send buffer associated with the peer is full. It means the peer is probably not
-    /// reading data from the wire in a timely manner.
-    SendBufferFull {
-        /// The peer associated with the event.
-        peer: PeerId,
-        /// The message that could not be sent to the peer.
-        message: M,
-    },
-}
-
-/// Explains why a client connection was disconnected.
-#[derive(Debug)]
-pub enum DisconnectReason {
-    /// The reactor was asked to perform a disconnect.
-    Requested,
-    /// The peer left and the end of stream was reached.
-    Left,
-    /// The peer violated the protocol in some way, usually by sending a malformed message.
-    CodecViolation,
-    /// The write side is stale, i.e. the peer is not reading the data we are sending.
-    WriteStale,
-    /// An IO error occurred.
-    Error(io::Error),
-}
-
-/// Non-blocking network reactor. This always runs in its own thread and communicates with the
-/// caller using [`Handle`].
-pub struct Reactor<C, M, T>
-where
-    C: Connector,
-    M: Message,
-    T: IntoTarget,
-{
-    poll: Poll,
+/// Runs a new reactor using custom settings and a custom reactor.
+pub fn run_with_connector<M: Message, C: connector::Connector>(
     config: Config,
-    sender: EventSender<M, T>,
-    receiver: Receiver<SystemCommand<M, T>>,
     connector: C,
-    waker: Arc<Waker>,
-    connect_tx: crossbeam_channel::Sender<ConnectResult<T>>,
-    connect_rx: crossbeam_channel::Receiver<ConnectResult<T>>,
+) -> std::io::Result<Handle<M>> {
+    let (reactor, handle) = Reactor::with_connector(config, connector)?;
+    let join_handle = reactor.run();
+    Ok(handle.into_running(join_handle))
 }
 
-impl<M: Message, T: IntoTarget> Reactor<connector::DefaultConnector, M, T> {
-    /// Creates a new reactor with the default connector.
-    pub fn new(config: Config) -> io::Result<(Self, Handle<M, T>)> {
-        Self::with_connector(config, connector::DefaultConnector)
-    }
-}
-
+/// Runs a new peerlink instance that connects through a socks5 proxy. Credentials (username and
+/// password) are required if the proxy requires them.
+///
+/// Only available with the `socks` feature.
 #[cfg(feature = "socks")]
-impl<M: Message, T: IntoTarget> Reactor<connector::Socks5Connector, M, T> {
-    /// Creates a new reactor that connects through a socks5 proxy. Credentials (username and
-    /// password) are required if the proxy requires them.
-    ///
-    /// Only available with the `socks` feature.
-    pub fn with_proxy(
-        config: Config,
-        proxy: SocketAddr,
-        credentials: Option<(String, String)>,
-    ) -> io::Result<(Self, Handle<M, T>)> {
-        Self::with_connector(config, connector::Socks5Connector { proxy, credentials })
-    }
-}
-
-/// Convenience type that allows us to easily switch between send implementations depending on the
-/// execution model and which feature is active.
-struct EventSender<M: Message, T: IntoTarget>(Sender<Event<M, T>>);
-
-impl<M: Message, T: IntoTarget> EventSender<M, T> {
-    /// Sends an event to the handle.
-    fn send(&self, event: Event<M, T>) {
-        #[cfg(feature = "async")]
-        let _ = self.0.send_blocking(event);
-        #[cfg(not(feature = "async"))]
-        let _ = self.0.send(event);
-    }
-}
-
-impl<C, M, T> Reactor<C, M, T>
-where
-    C: Connector + Sync + Send + 'static,
-    M: Message,
-    T: IntoTarget,
-{
-    /// Creates a new reactor with a custom connector.
-    pub fn with_connector(config: Config, connector: C) -> io::Result<(Self, Handle<M, T>)> {
-        let poll = Poll::new()?;
-        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
-
-        let (cmd_sender, cmd_receiver) = channel(None);
-        let (event_sender, event_receiver) = channel(config.receive_backpressure_control);
-
-        let command_sender = Handle {
-            sender: cmd_sender,
-            receiver: event_receiver,
-            waker: waker.clone(),
-        };
-
-        let (connect_tx, connect_rx) = crossbeam_channel::unbounded();
-
-        let reactor = Self {
-            poll,
-            config,
-            sender: EventSender(event_sender),
-            receiver: cmd_receiver,
-            connector,
-            waker,
-            connect_tx,
-            connect_rx,
-        };
-
-        Ok((reactor, command_sender))
-    }
-
-    /// Runs the reactor in a newly spawned thread and returns a join handle to that thread.
-    pub fn run(self) -> std::thread::JoinHandle<io::Result<()>> {
-        std::thread::spawn(|| run(self))
-    }
+pub fn run_with_socks5_proxy<M: Message, C: connector::Connector>(
+    config: Config,
+    proxy: SocketAddr,
+    credentials: Option<(String, String)>,
+) -> std::io::Result<Handle<M>> {
+    let connector = connector::Socks5Connector { proxy, credentials };
+    let (reactor, handle) = Reactor::with_connector(config, connector)?;
+    let join_handle = reactor.run();
+    Ok(handle.into_running(join_handle))
 }
 
 /// Provides bidirectional communication with a reactor. If this is dropped the reactor stops.
-pub struct Handle<M: Message, T: IntoTarget> {
+pub struct Handle<M: Message> {
     waker: Arc<Waker>,
-    sender: Sender<SystemCommand<M, T>>,
-    receiver: Receiver<Event<M, T>>,
+    sender: Sender<SystemCommand<M>>,
+    receiver: Receiver<Event<M>>,
+    join_handle: std::thread::JoinHandle<io::Result<()>>,
 }
 
-impl<M: Message, T: IntoTarget> Handle<M, T> {
+impl<M: Message> Handle<M> {
     /// Sends a command to a reactor associated with this handle. If this produces an IO error,
     /// it means the reactor is irrecoverable and should be discarded. This method never blocks so
     /// it is appropriate for use in async contexts.
-    pub fn send(&self, command: Command<M, T>) -> io::Result<()> {
+    pub fn send(&self, command: Command<M>) -> io::Result<()> {
         #[cfg(not(feature = "async"))]
         let result = self.sender.send(SystemCommand::P2P(command));
         #[cfg(feature = "async")]
@@ -235,7 +83,7 @@ impl<M: Message, T: IntoTarget> Handle<M, T> {
     /// produced, the reactor is irrecoverable and should be discarded. While this method is
     /// available in async contexts, it **should not** be used there. Use `receiver()` to get a
     /// raw handle on the receiver for use in async scenarios or where extra API surfaces are required.
-    pub fn receive_blocking(&self) -> io::Result<Event<M, T>> {
+    pub fn receive_blocking(&self) -> io::Result<Event<M>> {
         #[cfg(not(feature = "async"))]
         let result = self.receiver.recv();
         #[cfg(feature = "async")]
@@ -246,12 +94,12 @@ impl<M: Message, T: IntoTarget> Handle<M, T> {
 
     /// Exposes the receive portion of the handle. The receiver could be of a blocking or async
     /// variety, depending on which feature is active.
-    pub fn receiver(&self) -> &Receiver<Event<M, T>> {
+    pub fn receiver(&self) -> &Receiver<Event<M>> {
         &self.receiver
     }
 
     /// Shuts down the reactor and consumes the handle. No further commands can be sent afterward.
-    pub fn shutdown(self) -> io::Result<()> {
+    pub fn shutdown(self) -> io::Result<std::thread::JoinHandle<io::Result<()>>> {
         #[cfg(not(feature = "async"))]
         let result = self.sender.send(SystemCommand::Shutdown);
         #[cfg(feature = "async")]
@@ -263,7 +111,9 @@ impl<M: Message, T: IntoTarget> Handle<M, T> {
                 io::ErrorKind::BrokenPipe,
                 "channel disconnected",
             )),
-        }
+        }?;
+
+        Ok(self.join_handle)
     }
 
     /// Causes the reactor to panic. For testing only. No further commands can be sent afterward.
@@ -284,35 +134,125 @@ impl<M: Message, T: IntoTarget> Handle<M, T> {
     }
 }
 
-/// The direction of a peer connection.
-#[derive(Debug)]
-enum Direction<T: IntoTarget> {
-    /// The connection is from a remote peer to the reactor.
-    Inbound {
-        interface: SocketAddr,
-        addr: SocketAddr,
-    },
-    /// The connection is from the reactor to a remote peer.
-    Outbound { target: T },
+struct IdleHandle<M: Message> {
+    waker: Arc<Waker>,
+    sender: Sender<SystemCommand<M>>,
+    receiver: Receiver<Event<M>>,
 }
 
-/// The state of a peer connection.
-enum State {
-    /// The connection is still being established.
-    Connecting { start: Instant },
-    /// The connection is established and ready.
-    Connected { id: PeerId },
+impl<M: Message> IdleHandle<M> {
+    fn into_running(self, join_handle: std::thread::JoinHandle<io::Result<()>>) -> Handle<M> {
+        Handle {
+            waker: self.waker,
+            sender: self.sender,
+            receiver: self.receiver,
+            join_handle,
+        }
+    }
 }
 
-/// Contains a TCP connection along with its metadata.
-struct Connection<T: IntoTarget> {
-    stream: MessageStream<TcpStream>,
-    direction: Direction<T>,
-    state: State,
+/// Non-blocking network reactor. This always runs in its own thread and communicates with the
+/// caller using [`Handle`].
+struct Reactor<C, M>
+where
+    C: Connector,
+    M: Message,
+{
+    poll: Poll,
+    config: Config,
+    sender: EventSender<M>,
+    receiver: Receiver<SystemCommand<M>>,
+    connector: C,
+    waker: Arc<Waker>,
+    connect_tx: crossbeam_channel::Sender<ConnectResult>,
+    connect_rx: crossbeam_channel::Receiver<ConnectResult>,
+    listeners: Vec<(TcpListener, SocketAddr)>,
+    connection_manager: connection::Manager,
+    scheduler: scheduler::Scheduler,
+    rx_buf: Vec<u8>,
 }
 
-/// Runs the reactor in a loop until an error is produced or the shutdown command is received.
-fn run<C, M, T>(
+impl<M: Message> Reactor<connector::DefaultConnector, M> {
+    /// Creates a new reactor with the default connector.
+    fn new(config: Config) -> io::Result<(Self, IdleHandle<M>)> {
+        Self::with_connector(config, connector::DefaultConnector)
+    }
+}
+
+impl<C, M> Reactor<C, M>
+where
+    C: Connector + Sync + Send + 'static,
+    M: Message,
+{
+    /// Creates a new reactor with a custom connector.
+    fn with_connector(config: Config, connector: C) -> io::Result<(Self, IdleHandle<M>)> {
+        let poll = Poll::new()?;
+        let waker = Arc::new(Waker::new(poll.registry(), scheduler::WAKER)?);
+
+        let (cmd_sender, cmd_receiver) = channel(None);
+        let (event_sender, event_receiver) = channel(config.receive_channel_size);
+
+        let command_sender = IdleHandle {
+            sender: cmd_sender,
+            receiver: event_receiver,
+            waker: waker.clone(),
+        };
+
+        let (connect_tx, connect_rx) = crossbeam_channel::unbounded();
+
+        let listeners: Vec<_> = config
+            .bind_addr
+            .iter()
+            .enumerate()
+            .map(|(offset, addr)| {
+                let mut listener = TcpListener::bind(*addr)?;
+                let token = usize::MAX - 1 - offset;
+
+                poll.registry()
+                    .register(&mut listener, Token(token), Interest::READABLE)?;
+
+                log::info!("Server (token {token}): listen at {addr}");
+
+                Ok((listener, *addr))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        let scheduler = scheduler::Scheduler::new(listeners.len());
+        let receive_buf_size = config.receive_buffer_size.min(M::MAX_SIZE);
+        let mut read_buf = Vec::with_capacity(receive_buf_size);
+
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            // this is a receive buffer where we never care about the part that was not filled,
+            // so having uninit memory is fine
+            read_buf.set_len(receive_buf_size);
+        };
+
+        let reactor = Self {
+            poll,
+            config,
+            sender: EventSender(event_sender),
+            receiver: cmd_receiver,
+            connector,
+            waker,
+            connect_tx,
+            connect_rx,
+            listeners,
+            connection_manager: connection::Manager::new(),
+            scheduler,
+            rx_buf: read_buf,
+        };
+
+        Ok((reactor, command_sender))
+    }
+
+    /// Runs the reactor in a newly spawned thread and returns a join handle to that thread.
+    fn run(self) -> std::thread::JoinHandle<io::Result<()>> {
+        std::thread::spawn(|| run_inner(self))
+    }
+}
+
+fn run_inner<C, M>(
     Reactor {
         mut poll,
         config,
@@ -322,421 +262,290 @@ fn run<C, M, T>(
         waker,
         connect_tx,
         connect_rx,
-    }: Reactor<C, M, T>,
+        listeners,
+        mut connection_manager,
+        mut scheduler,
+        rx_buf: mut read_buf,
+    }: Reactor<C, M>,
 ) -> io::Result<()>
 where
     C: Connector + Sync + Send + 'static,
     M: Message,
-    T: IntoTarget,
 {
-    let listeners: Vec<_> = config
-        .bind_addr
-        .into_iter()
-        .enumerate()
-        .map(|(offset, addr)| {
-            let mut server = TcpListener::bind(addr)?;
-            let token = usize::MAX - 1 - offset;
-
-            poll.registry()
-                .register(&mut server, Token(token), Interest::READABLE)?;
-
-            log::info!("Server (token {token}): listen at {addr}");
-
-            Ok(server)
-        })
-        .collect::<std::io::Result<Vec<_>>>()?;
-
-    let mut connections: Slab<Connection<T>> = Slab::with_capacity(16);
-    let mut events = Events::with_capacity(1024);
-    let mut last_maintenance = Instant::now();
-    let mut token_map: IntMap<PeerId, Token> = IntMap::default();
-    let mut next_peer_id = PeerId(0);
-
-    let mut read_buf = Vec::with_capacity(config.receive_buffer_size);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        // this is a receive buffer where we never care about the part that was not filled,
-        // so having uninit memory is fine
-        read_buf.set_len(config.receive_buffer_size);
-    };
-
+    let mut round: u64 = 0;
     loop {
-        poll.poll(&mut events, POLL_INTERVAL)?;
+        scheduler.update(&mut poll)?;
 
         let now = Instant::now();
 
-        'events: for event in &events {
-            match (event.token(), connections.get_mut(event.token().into())) {
-                (WAKE_TOKEN, None) => {
-                    log::trace!("waker event");
+        if scheduler.waker() {
+            log::trace!("waker event");
 
-                    for connect in connect_rx.try_iter() {
-                        match connect.result {
-                            Ok(stream) => {
-                                add_stream(
-                                    poll.registry(),
-                                    &mut connections,
-                                    Direction::Outbound {
-                                        target: connect.target,
-                                    },
-                                    stream,
-                                    config.stream_config,
-                                )?;
+            for cmd in std::iter::from_fn(|| receiver.try_recv().ok()) {
+                log::trace!("command: {:?}", cmd);
+
+                match cmd {
+                    SystemCommand::P2P(Command::Connect(target)) => {
+                        initiate_connect(&connector, target, &waker, &connect_tx);
+                    }
+
+                    SystemCommand::P2P(Command::Disconnect(peer)) => {
+                        if connection_manager.disconnect(&peer, poll.registry(), now)? {
+                            sender.send(Event::Disconnected {
+                                peer,
+                                reason: DisconnectReason::Requested,
+                            });
+                            log::debug!("disconnect: peer {peer} disconnected");
+                        } else {
+                            sender.send(Event::NoPeer(peer));
+                            log::warn!("disconnect: peer {peer} not found");
+                        }
+                    }
+
+                    SystemCommand::P2P(Command::Message(peer, message)) => {
+                        match connection_manager.get_by_peer_id(&peer) {
+                            Some(connection) => {
+                                if !connection.queue_message(&message, poll.registry())? {
+                                    sender.send(Event::SendBufferFull { peer, message });
+                                    log::debug!("message: send buffer for peer {peer} is full");
+                                }
                             }
-
-                            Err(err) => {
-                                sender.send(Event::ConnectedTo {
-                                    target: connect.target,
-                                    result: Err(err),
-                                });
+                            None => {
+                                sender.send(Event::NoPeer(peer));
+                                log::warn!("message: peer {peer} not found");
                             }
                         }
                     }
 
-                    for cmd in std::iter::from_fn(|| receiver.try_recv().ok()) {
-                        log::trace!("command: {:?}", cmd);
-
-                        match cmd {
-                            SystemCommand::P2P(Command::Connect(target)) => {
-                                initiate_connect(&connector, target, &waker, &connect_tx);
-                            }
-
-                            SystemCommand::P2P(Command::Disconnect(peer)) => {
-                                if token_map.contains_key(&peer) {
-                                    let mut connection = remove_stream(
-                                        poll.registry(),
-                                        &mut connections,
-                                        &mut token_map,
-                                        peer,
-                                    )?;
-
-                                    let _ = connection.stream.write(now);
-                                    let _ = connection.stream.shutdown();
-
-                                    log::debug!("disconnect: peer {peer} disconnected");
-
-                                    sender.send(Event::Disconnected {
-                                        peer,
-                                        reason: DisconnectReason::Requested,
-                                    });
-                                } else {
-                                    sender.send(Event::NoPeer(peer));
-                                    log::warn!("disconnect: peer {peer} not found");
-                                }
-                            }
-
-                            SystemCommand::P2P(Command::Message(peer, message)) => {
-                                match token_map.get(&peer) {
-                                    Some(token) => {
-                                        let connection = connections
-                                            .get_mut(token.0)
-                                            .expect("token->connection must exist here");
-
-                                        if connection.stream.queue_message(&message) {
-                                            poll.registry().reregister(
-                                                connection.stream.as_source(),
-                                                *token,
-                                                Interest::READABLE | Interest::WRITABLE,
-                                            )?;
-                                        } else {
-                                            sender.send(Event::SendBufferFull { peer, message });
-                                            log::debug!(
-                                                "message: send buffer for peer {peer} is full"
-                                            );
-                                        }
-                                    }
-
-                                    None => {
-                                        sender.send(Event::NoPeer(peer));
-                                        log::warn!("message: peer {peer} not found");
-                                    }
-                                }
-                            }
-
-                            SystemCommand::Shutdown => {
-                                for (id, mut connection) in connections {
-                                    let _ = connection.stream.write(now);
-                                    if connection
-                                        .stream
-                                        .is_write_stale(now + Duration::from_secs(3600))
-                                    {
-                                        log::debug!("shutdown: connection had unsent data");
-                                    }
-                                    let shutdown_result = connection.stream.shutdown();
-
-                                    log::debug!("shutdown: stream {}: {:?}", id, shutdown_result);
-                                }
-
-                                return Ok(());
-                            }
-
-                            #[cfg(debug_assertions)]
-                            SystemCommand::Panic => panic!("panic command received"),
-                        }
-                    }
-                }
-
-                (token, None) if is_listener(listeners.len(), token) => {
-                    let listener = usize::MAX - 1 - token.0;
-                    let interface = listeners[listener].local_addr()?;
-                    log::trace!("listener: {} (interface {interface})", token.0);
-
-                    while has_slot(connections.len(), connections.vacant_key()) {
-                        match listeners[listener].accept() {
-                            Ok((stream, addr)) => {
-                                add_stream(
-                                    poll.registry(),
-                                    &mut connections,
-                                    Direction::Inbound { interface, addr },
-                                    stream,
-                                    config.stream_config,
-                                )?;
-                                log::debug!("accepted connection from {addr}");
-                            }
-                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(err) => log::debug!("accept error: {}", err),
-                        }
-                    }
-                }
-
-                (token, Some(connection)) => {
-                    let peer = match connection.state {
-                        State::Connecting { .. } => {
-                            if !connection.stream.is_ready() {
-                                log::debug!("stream not ready: {:?}", connection.direction);
-
-                                continue 'events;
-                            } else {
-                                log::debug!("stream ready: {:?}", connection.direction);
-
-                                let peer = next_peer_id;
-                                let prev_mapping = token_map.insert(peer, token);
-                                assert!(prev_mapping.is_none());
-                                next_peer_id = next_peer_id.next();
-
-                                connection.state = State::Connected { id: peer };
-
-                                let event = match &connection.direction {
-                                    Direction::Inbound { interface, addr } => {
-                                        Event::ConnectedFrom {
-                                            peer,
-                                            addr: *addr,
-                                            interface: *interface,
-                                        }
-                                    }
-                                    Direction::Outbound { target } => Event::ConnectedTo {
-                                        target: target.clone(),
-                                        result: Ok(peer),
-                                    },
-                                };
-
-                                poll.registry().reregister(
-                                    connection.stream.as_source(),
-                                    token,
-                                    Interest::READABLE,
-                                )?;
-
-                                sender.send(event);
-                            }
-
-                            continue;
-                        }
-                        State::Connected { id } => id,
-                    };
-
-                    if event.is_readable() {
-                        log::trace!("readable: peer {peer}");
-
-                        if let Err(err) = connection.stream.read(&mut read_buf, |message| {
-                            log::debug!("read: peer {peer}: message={:?}", message);
-                            sender.send(Event::Message { peer, message });
-                        }) {
-                            let reason = match err {
-                                message_stream::ReadError::MalformedMessage => {
-                                    log::info!("read: peer {peer}: codec violation");
-                                    DisconnectReason::CodecViolation
-                                }
-                                message_stream::ReadError::EndOfStream => {
-                                    log::debug!("peer {peer}: peer left");
-                                    DisconnectReason::Left
-                                }
-                                message_stream::ReadError::Error(err) => {
-                                    log::debug!("write: peer {peer}: IO error: {err}");
-                                    DisconnectReason::Error(err)
-                                }
-                            };
-
-                            remove_stream(poll.registry(), &mut connections, &mut token_map, peer)?;
-
-                            sender.send(Event::Disconnected { peer, reason });
-
-                            continue 'events;
-                        }
+                    SystemCommand::Shutdown => {
+                        connection_manager.shutdown(now);
+                        return Ok(());
                     }
 
-                    if event.is_writable() {
-                        log::trace!("writeable: peer {peer}");
-
-                        match connection.stream.write(now) {
-                            Ok(()) => {
-                                let interest = connection.stream.interest();
-                                poll.registry().reregister(
-                                    connection.stream.as_source(),
-                                    token,
-                                    interest,
-                                )?;
-                            }
-
-                            Err(err) => {
-                                log::debug!("write: peer {peer}: IO error: {err}");
-
-                                remove_stream(
-                                    poll.registry(),
-                                    &mut connections,
-                                    &mut token_map,
-                                    peer,
-                                )?;
-
-                                sender.send(Event::Disconnected {
-                                    peer,
-                                    reason: DisconnectReason::Error(err),
-                                });
-                            }
-                        }
-                    }
-                }
-
-                (_token, connection) => {
-                    log::debug!(
-                        "spurious event: event={:?}, connection is_some={}",
-                        event,
-                        connection.is_some()
-                    );
+                    #[cfg(debug_assertions)]
+                    SystemCommand::Panic => panic!("panic command received"),
                 }
             }
-        }
 
-        // if we get an error during deregistration, the reactor must terminate
-        let mut deregister_error = Ok(());
+            // process outbound connection attempt results
+            for connect in connect_rx.try_iter() {
+                match connect.result {
+                    Ok(stream) => {
+                        // The connection could be in any state, still needs
+                        // to undergo connectedness checks by expressing
+                        // WRITE interest. Cannot assume anything here.
+                        connection_manager.add_outbound(
+                            poll.registry(),
+                            stream,
+                            config.stream_config,
+                            now,
+                            connect.target,
+                        )?;
+                    }
 
-        // dead stream removal
-        connections.retain(|_, connection| {
-            let retain = match connection.state {
-                State::Connecting { start }
-                    if (now - start) > config.stream_config.stream_connect_timeout =>
-                {
-                    log::debug!("connect timeout: {:?}", &connection.direction);
-
-                    if let Direction::Outbound { target } = &connection.direction {
+                    Err(err) => {
                         sender.send(Event::ConnectedTo {
-                            target: target.clone(),
-                            result: Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "Connect attempt timed out",
-                            )),
+                            target: connect.target,
+                            result: Err(err),
                         });
                     }
-
-                    false
                 }
-                State::Connected { id } if connection.stream.is_write_stale(now) => {
-                    sender.send(Event::Disconnected {
-                        peer: id,
-                        reason: DisconnectReason::WriteStale,
+            }
+        }
+
+        for token in scheduler.listeners() {
+            let listener = usize::MAX - 1 - token.0;
+            let (listener, interface) = &listeners[listener];
+            log::trace!("listener: {} (interface {interface})", token.0);
+
+            while connection_manager.has_slot(listeners.len()) {
+                match listener.accept() {
+                    Ok((stream, addr)) => {
+                        let peer = connection_manager.add_inbound(
+                            poll.registry(),
+                            stream,
+                            config.stream_config,
+                        )?;
+                        sender.send(Event::ConnectedFrom {
+                            peer,
+                            addr,
+                            interface: *interface,
+                        });
+                        log::debug!("accepted connection from {addr}");
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(err) => log::debug!("accept error: {}", err),
+                }
+            }
+        }
+
+        scheduler.connections(round, |token, is_readable, is_writable, is_standalone| {
+            let (peer, connection) = match connection_manager.try_ready(&token, poll.registry())? {
+                connection::Connectedness::Nonexistent => {
+                    if is_standalone {
+                        // standalone readiness that maps to no connection, probably expired
+                        return Ok(scheduler::Carryover::none());
+                    } else {
+                        // this is a serious logic error, should never happen
+                        unreachable!("try_ready: token -> connection mapping nonexistent");
+                    }
+                }
+                connection::Connectedness::New { peer, target } => {
+                    assert!(!is_readable && is_writable);
+                    sender.send(Event::ConnectedTo {
+                        target,
+                        result: Ok(peer),
                     });
-
-                    false
+                    return Ok(scheduler::Carryover::none());
                 }
-                _ => true,
+                connection::Connectedness::Ready { peer, connection } => (peer, connection),
+                connection::Connectedness::NotReady => {
+                    return Ok(scheduler::Carryover::none());
+                }
+                connection::Connectedness::Errored { target, error } => {
+                    sender.send(Event::ConnectedTo {
+                        target,
+                        result: Err(error),
+                    });
+                    return Ok(scheduler::Carryover::none());
+                }
             };
 
-            if !retain {
-                if let Err(err) = poll.registry().deregister(connection.stream.as_source()) {
-                    deregister_error = Err(err);
-                }
+            let mut read_carryover = false;
 
-                if let State::Connected { id } = connection.state {
-                    token_map.remove(&id);
+            if is_readable {
+                log::trace!("readable: peer {peer}");
+
+                match connection.read(&mut read_buf, |message, size| {
+                    log::debug!("read: peer {peer}: message={:?}", message);
+                    sender.send(Event::Message {
+                        peer,
+                        message,
+                        size,
+                    });
+                }) {
+                    Ok(maybe_read_carryover) => {
+                        read_carryover = maybe_read_carryover;
+                    }
+                    Err(err) => {
+                        let reason = match err {
+                            message_stream::ReadError::MalformedMessage => {
+                                log::info!("read: peer {peer}: codec violation");
+                                DisconnectReason::CodecViolation
+                            }
+                            message_stream::ReadError::EndOfStream => {
+                                log::debug!("peer {peer}: peer left");
+                                DisconnectReason::Left
+                            }
+                            message_stream::ReadError::Error(err) => {
+                                log::debug!("read: peer {peer}: IO error: {err}");
+                                DisconnectReason::Error(err)
+                            }
+                        };
+
+                        connection_manager.disconnect(&peer, poll.registry(), now)?;
+                        sender.send(Event::Disconnected { peer, reason });
+
+                        return Ok(scheduler::Carryover::none());
+                    }
                 }
             }
 
-            retain
-        });
+            if is_writable {
+                // we are either just connected or just ready to write
+                log::trace!("writeable: peer {peer}");
 
-        deregister_error?;
+                if let Err(err) = connection.write(now, poll.registry(), token)? {
+                    log::debug!("write: peer {peer}: IO error: {err}");
 
-        // periodic maintenance
-        if (now - last_maintenance).as_secs() > 30 {
-            // buffer resize
-            for (_, connection) in &mut connections {
-                connection.stream.shrink_buffers();
+                    connection_manager.disconnect(&peer, poll.registry(), now)?;
+
+                    sender.send(Event::Disconnected {
+                        peer,
+                        reason: DisconnectReason::Error(err),
+                    });
+                }
             }
 
-            last_maintenance = now;
+            Ok(scheduler::Carryover {
+                r: read_carryover,
+                w: false,
+            })
+        })?;
+
+        for dead in connection_manager.remove_dead(now, &config, poll.registry())? {
+            match dead {
+                connection::Dead::OutboundTimeout(target) => {
+                    sender.send(Event::ConnectedTo {
+                        target,
+                        result: Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Connect attempt timed out",
+                        )),
+                    });
+                }
+                connection::Dead::WriteStale(peer) => {
+                    sender.send(Event::Disconnected {
+                        peer,
+                        reason: DisconnectReason::WriteStale,
+                    });
+                }
+            }
         }
+
+        connection_manager.compact(now, poll.registry(), |from, to| {
+            scheduler.rekey(from, to);
+        })?;
+
+        round += 1;
     }
 }
 
-/// Registers a peer with the poll and adds it to the connection list.
-fn add_stream<T: IntoTarget>(
-    registry: &Registry,
-    connections: &mut Slab<Connection<T>>,
-    direction: Direction<T>,
-    mut stream: TcpStream,
-    stream_cfg: message_stream::StreamConfig,
-) -> std::io::Result<()> {
-    let vacancy = connections.vacant_entry();
+/// Convenience type that allows us to easily switch between send implementations depending on the
+/// execution model and which feature is active.
+struct EventSender<M: Message>(Sender<Event<M>>);
 
-    registry.register(&mut stream, Token(vacancy.key()), Interest::WRITABLE)?;
-
-    vacancy.insert(Connection {
-        stream: MessageStream::new(stream, stream_cfg),
-        direction,
-        state: State::Connecting {
-            start: Instant::now(),
-        },
-    });
-
-    Ok(())
+impl<M: Message> EventSender<M> {
+    /// Sends an event to the handle.
+    fn send(&self, event: Event<M>) {
+        #[cfg(feature = "async")]
+        let _ = self.0.send_blocking(event);
+        #[cfg(not(feature = "async"))]
+        let _ = self.0.send(event);
+    }
 }
 
-/// Deregisters a peer from the poll and removes it from the connection list.
-fn remove_stream<T: IntoTarget>(
-    registry: &Registry,
-    connections: &mut Slab<Connection<T>>,
-    token_map: &mut IntMap<PeerId, Token>,
-    peer: PeerId,
-) -> std::io::Result<Connection<T>> {
-    let token = token_map
-        .remove(&peer)
-        .expect("peer->token must exist at deregistration");
-
-    let mut connection = connections.remove(token.0);
-
-    registry.deregister(connection.stream.as_source())?;
-
-    Ok(connection)
+/// System commands. Not for external use.
+#[derive(Debug)]
+enum SystemCommand<M: Message> {
+    /// Various P2P commands.
+    P2P(Command<M>),
+    /// Close all connections and shut down the reactor.
+    Shutdown,
+    /// Causes the event loop to panic. Only available in debug mode for integration testing.
+    #[cfg(debug_assertions)]
+    Panic,
 }
 
 /// Describes the result of a connect attempt against a remote host.
-struct ConnectResult<T: IntoTarget> {
-    target: T,
+struct ConnectResult {
+    target: Target,
     result: io::Result<mio::net::TcpStream>,
 }
 
 /// Initiates a connect procedure against a remote host using a `Connector` implementation.
-fn initiate_connect<C: Connector, T: IntoTarget>(
+fn initiate_connect<C: Connector>(
     connector: &C,
-    target: T,
+    target: Target,
     waker: &Arc<Waker>,
-    sender: &crossbeam_channel::Sender<ConnectResult<T>>,
+    sender: &crossbeam_channel::Sender<ConnectResult>,
 ) {
     #[inline]
-    fn connect<C: Connector, T: IntoTarget>(
+    fn connect<C: Connector>(
         connector: &C,
-        target: T,
+        target: Target,
         waker: &Arc<Waker>,
-        sender: &crossbeam_channel::Sender<ConnectResult<T>>,
+        sender: &crossbeam_channel::Sender<ConnectResult>,
     ) {
         let start = Instant::now();
         let result = connector.connect(&target);
@@ -761,18 +570,6 @@ fn initiate_connect<C: Connector, T: IntoTarget>(
     }
 }
 
-/// Checks if a token is associated with the server (connection listener).
-#[inline(always)]
-fn is_listener(n_listeners: usize, token: Token) -> bool {
-    token != WAKE_TOKEN && token.0 >= (usize::MAX - n_listeners)
-}
-
-/// Checks if it is possible to accept a new connection.
-#[inline(always)]
-fn has_slot(n_listeners: usize, next_key: usize) -> bool {
-    next_key < usize::MAX - n_listeners
-}
-
 #[cfg(not(feature = "async"))]
 fn channel<M>(
     cap: Option<NonZeroUsize>,
@@ -788,28 +585,5 @@ fn channel<M>(cap: Option<NonZeroUsize>) -> (async_channel::Sender<M>, async_cha
     match cap {
         Some(cap) => async_channel::bounded(cap.into()),
         None => async_channel::unbounded(),
-    }
-}
-
-#[cfg(test)]
-mod test {
-    #[test]
-    fn is_listener() {
-        use super::{WAKE_TOKEN, is_listener};
-        use mio::Token;
-
-        assert!(!is_listener(0, WAKE_TOKEN));
-        assert!(!is_listener(0, Token(WAKE_TOKEN.0 - 1)));
-        assert!(!is_listener(0, Token(usize::MIN)));
-
-        assert!(!is_listener(1, WAKE_TOKEN));
-        assert!(is_listener(1, Token(WAKE_TOKEN.0 - 1)));
-        assert!(!is_listener(1, Token(WAKE_TOKEN.0 - 2)));
-
-        assert!(!is_listener(3, WAKE_TOKEN));
-        assert!(is_listener(3, Token(WAKE_TOKEN.0 - 1)));
-        assert!(is_listener(3, Token(WAKE_TOKEN.0 - 2)));
-        assert!(is_listener(3, Token(WAKE_TOKEN.0 - 3)));
-        assert!(!is_listener(3, Token(WAKE_TOKEN.0 - 4)));
     }
 }

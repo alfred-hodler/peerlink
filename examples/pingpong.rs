@@ -1,5 +1,6 @@
-use peerlink::reactor::Event;
-use peerlink::{Command, Config, Reactor};
+use std::net::SocketAddr;
+
+use peerlink::{Command, Config, Event};
 
 // This example consists of a client and server. The server waits for inbound connections from
 // clients and replies to client pings with pongs.
@@ -17,6 +18,8 @@ enum Message {
 // Then we define the codec for the messages we plan on sending and receiving. The encoding is
 // entirely arbitrary.
 impl peerlink::Message for Message {
+    const MAX_SIZE: usize = 12;
+
     fn encode(&self, dest: &mut impl std::io::Write) -> usize {
         let (msg_type, value) = match &self {
             Message::Ping(p) => (b"ping", p),
@@ -54,12 +57,10 @@ fn server() -> std::io::Result<()> {
     println!("Server: starting to listen on address {}", bind_addr);
 
     // Create the reactor and get its handle.
-    let (reactor, handle) = Reactor::<_, _, String>::new(Config {
+    let handle = peerlink::run::<_>(Config {
         bind_addr: vec![bind_addr],
         ..Default::default()
     })?;
-
-    let _join_handle = reactor.run();
 
     // Start processing events.
     loop {
@@ -75,12 +76,18 @@ fn server() -> std::io::Result<()> {
                 );
             }
 
-            Event::Message { peer, message } => match message {
+            Event::Message {
+                peer,
+                message,
+                size,
+            } => match message {
                 Message::Ping(p) => {
+                    assert_eq!(size, 12);
                     println!("Incoming ping: peer={}, value={}", peer, p);
                     handle.send(Command::Message(peer, Message::Pong(p)))?;
                 }
                 Message::Pong(p) => {
+                    assert_eq!(size, 12);
                     println!("Incoming pong: peer={}, value={}", peer, p);
                 }
             },
@@ -94,19 +101,17 @@ fn server() -> std::io::Result<()> {
 // the server disappears.
 fn client() -> std::io::Result<()> {
     // Create the reactor and get its handle.
-    let (reactor, handle) = Reactor::new(Config::default())?;
-
-    let _join_handle = reactor.run();
+    let handle = peerlink::run(Config::default())?;
 
     // Connect to our server.
-    let server_addr = "127.0.0.1:8080".to_string();
-    handle.send(Command::Connect(server_addr.clone()))?;
+    let server_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    handle.send(Command::connect(server_addr))?;
 
     let peer_id = match handle.receive_blocking()? {
         Event::ConnectedTo {
             target,
             result: Ok(peer_id),
-        } if target == server_addr => {
+        } if target == server_addr.into() => {
             println!("Connected to server at {}", target);
             peer_id
         }

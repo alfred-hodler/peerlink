@@ -1,6 +1,6 @@
 [package]
 name = "peerlink"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 authors = ["Alfred Hodler <alfred_hodler@protonmail.com>"]
 license = "MIT"
@@ -14,13 +14,13 @@ socks = ["dep:socks"]
 async = ["dep:async-channel"]
 
 [dependencies]
+async-channel = { version = "2.5.0", optional = true }
 crossbeam-channel = "0.5.15"
+hashbrown = "0.16.1"
 log = "0.4.28"
 mio = { version = "1.1.0", features = ["net", "os-poll"] }
-nohash-hasher = "0.2.0"
 slab = "0.4.11"
 socks = { version = "0.3.4", optional = true }
-async-channel = { version = "2.5.0", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11.8"

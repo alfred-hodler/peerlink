@@ -1,9 +1,8 @@
 use core::panic;
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::thread::JoinHandle;
+use std::net::{Ipv4Addr, SocketAddr};
 
-use peerlink::reactor::{DisconnectReason, Handle};
-use peerlink::{Command, Config, Event, PeerId, Reactor};
+use peerlink::Handle;
+use peerlink::{Command, Config, DisconnectReason, Event, PeerId};
 
 mod common;
 use common::Message;
@@ -93,15 +92,14 @@ fn batches() {
 fn many_to_one_interleaved() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8103).into();
+    let server_addr = (Ipv4Addr::LOCALHOST, 8103);
 
     let server_config = Config {
-        bind_addr: vec![server_addr],
+        bind_addr: vec![server_addr.into()],
         ..Default::default()
     };
 
-    let (server_reactor, server) = Reactor::new(server_config).unwrap();
-    server_reactor.run();
+    let server = peerlink::run(server_config).unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(10));
 
@@ -110,10 +108,9 @@ fn many_to_one_interleaved() {
     let clients: Vec<_> = (0..n_clients)
         .enumerate()
         .map(|(i, _)| {
-            let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
-            client_reactor.run();
+            let client = peerlink::run(Config::default()).unwrap();
 
-            let (client_peer, _) = connect(&client, &server, server_addr.to_string());
+            let (client_peer, _) = connect(&client, &server, server_addr.into());
             assert_eq!(i as u64, client_peer.inner());
 
             client
@@ -139,15 +136,14 @@ fn many_to_one_interleaved() {
 fn many_to_one_bulk() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8104).into();
+    let server_addr = (Ipv4Addr::LOCALHOST, 8104);
 
     let server_config = Config {
-        bind_addr: vec![server_addr],
+        bind_addr: vec![server_addr.into()],
         ..Default::default()
     };
 
-    let (server_reactor, server) = Reactor::new(server_config).unwrap();
-    server_reactor.run();
+    let server = peerlink::run(server_config).unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(10));
 
@@ -157,10 +153,9 @@ fn many_to_one_bulk() {
     let clients: Vec<_> = (0..n_clients)
         .enumerate()
         .map(|(i, _)| {
-            let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
-            client_reactor.run();
+            let client = peerlink::run(Config::default()).unwrap();
 
-            let (client_peer, _) = connect(&client, &server, server_addr.to_string());
+            let (client_peer, _) = connect(&client, &server, server_addr.into());
             assert_eq!(i as u64, client_peer.inner());
 
             client
@@ -203,16 +198,19 @@ fn very_large() {
 
     let (client_peer, _) = connect(&client, &server, server_addr);
     let ten_mb = vec![1; 1024 * 1024 * 10];
-    let message = Message::Data(ten_mb.clone());
+    let message = Message::Data(ten_mb);
 
     client.send(Command::Message(client_peer, message)).unwrap();
 
     match server.receive_blocking().unwrap() {
         Event::Message {
             message: Message::Data(data),
+            size,
             ..
-        } if data == ten_mb => {}
-        _ => panic!(""),
+        } if data.len() == 1024 * 1024 * 10
+            && data.iter().all(|x| *x == 1)
+            && size == (1024 * 1024 * 10 + 4 + 4) => {}
+        _ => panic!("bad data received"),
     }
 }
 
@@ -222,25 +220,23 @@ fn very_large() {
 fn peer_id_increments() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8106).into();
+    let server_addr = (Ipv4Addr::LOCALHOST, 8106);
 
     let server_config = Config {
-        bind_addr: vec![server_addr],
+        bind_addr: vec![server_addr.into()],
         ..Default::default()
     };
 
-    let (server_reactor, server) = Reactor::new(server_config).unwrap();
-    server_reactor.run();
+    let server = peerlink::run(server_config).unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     let n_clients = 5;
 
     for i in 0..n_clients {
-        let (client_reactor, client) = Reactor::new(Config::default()).unwrap();
-        client_reactor.run();
+        let client = peerlink::run(Config::default()).unwrap();
 
-        let (client_peer, _) = connect(&client, &server, server_addr.to_string());
+        let (client_peer, _) = connect(&client, &server, server_addr.into());
         assert_eq!(i as u64, client_peer.inner());
 
         let client_that_left = disconnect(&client, &server, PeerId::set_raw(0));
@@ -250,50 +246,37 @@ fn peer_id_increments() {
 
 #[allow(dead_code)]
 struct Scaffold {
-    server: Handle<Message, String>,
-    client: Handle<Message, String>,
-    server_join_handle: JoinHandle<Result<(), std::io::Error>>,
-    client_join_handle: JoinHandle<Result<(), std::io::Error>>,
-    server_addr: String,
+    server: Handle<Message>,
+    client: Handle<Message>,
+    server_addr: SocketAddr,
 }
 
 fn start_server_client(server_port: u16) -> Scaffold {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let server_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port).into();
+    let server_addr = (Ipv4Addr::LOCALHOST, server_port);
 
     let server_config = Config {
-        bind_addr: vec![server_addr],
+        bind_addr: vec![server_addr.into()],
         ..Default::default()
     };
 
-    let (server_reactor, server_handle) = Reactor::new(server_config).unwrap();
-    let (client_reactor, client_handle) = Reactor::new(Config::default()).unwrap();
-
-    let server_join_handle = server_reactor.run();
-    let client_join_handle = client_reactor.run();
-
-    // We are using this because there is a split-second moment between the server binding to a local
-    // socket and registering it for polling where it can miss notifications. This will never
-    // happen in practice but it is essentially a race condition that can deadlock a test if the
-    // running machine is fast enough.
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    let server_handle = peerlink::run(server_config).unwrap();
+    let client_handle = peerlink::run(Config::default()).unwrap();
 
     Scaffold {
         server: server_handle,
         client: client_handle,
-        server_join_handle,
-        client_join_handle,
-        server_addr: server_addr.to_string(),
+        server_addr: server_addr.into(),
     }
 }
 
 fn connect(
-    client: &Handle<Message, String>,
-    server: &Handle<Message, String>,
-    server_addr: String,
+    client: &Handle<Message>,
+    server: &Handle<Message>,
+    server_addr: SocketAddr,
 ) -> (PeerId, PeerId) {
-    client.send(Command::Connect(server_addr)).unwrap();
+    client.send(Command::connect(server_addr)).unwrap();
 
     let client_peer = match server.receive_blocking().unwrap() {
         peerlink::Event::ConnectedFrom { peer, .. } => {
@@ -316,11 +299,7 @@ fn connect(
     (client_peer, server_peer)
 }
 
-fn disconnect(
-    client: &Handle<Message, String>,
-    server: &Handle<Message, String>,
-    server_peer: PeerId,
-) -> PeerId {
+fn disconnect(client: &Handle<Message>, server: &Handle<Message>, server_peer: PeerId) -> PeerId {
     client.send(Command::Disconnect(server_peer)).unwrap();
 
     let client_that_left = match server.receive_blocking().unwrap() {
@@ -347,40 +326,43 @@ fn disconnect(
     client_that_left
 }
 
-fn message(handle: &Handle<Message, String>, peer: PeerId, message: Message) {
+fn message(handle: &Handle<Message>, peer: PeerId, message: Message) {
     handle.send(Command::Message(peer, message)).unwrap();
 }
 
-fn expect_ping(event: Event<Message, String>, nonce: u64) -> PeerId {
+fn expect_ping(event: Event<Message>, nonce: u64) -> PeerId {
     match event {
         peerlink::Event::Message {
             message: Message::Ping(p),
             peer,
-        } if nonce == p => peer,
+            size,
+        } if nonce == p && size == 12 => peer,
         event => {
             panic!("expected Ping({nonce}) but got {:?}", event);
         }
     }
 }
 
-fn expect_pong(event: Event<Message, String>, nonce: u64) -> PeerId {
+fn expect_pong(event: Event<Message>, nonce: u64) -> PeerId {
     match event {
         peerlink::Event::Message {
             message: Message::Pong(p),
             peer,
-        } if nonce == p => peer,
+            size,
+        } if nonce == p && size == 12 => peer,
         event => {
             panic!("expected Pong({nonce}) but got {:?}", event);
         }
     }
 }
 
-fn read_ping(event: Event<Message, String>) -> (PeerId, u64) {
+fn read_ping(event: Event<Message>) -> (PeerId, u64) {
     match event {
         peerlink::Event::Message {
             message: Message::Ping(p),
             peer,
-        } => (peer, p),
+            size,
+        } if size == 12 => (peer, p),
         event => {
             panic!("expected Ping(_) but got {:?}", event);
         }
