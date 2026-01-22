@@ -6,7 +6,7 @@ use mio::{Interest, Registry, Token};
 use slab::Slab;
 
 use crate::connector::Target;
-use crate::message_stream::{MessageStream, ReadError};
+use crate::message_stream::{MessageStream, ReadError, WriteResult};
 use crate::{Config, Message, PeerId, StreamConfig};
 
 /// The direction of a connection.
@@ -71,22 +71,28 @@ impl Connection {
         }
     }
 
+    /// Returns how many bytes can be queued immediately with respect to transmit buffer size limit.
+    pub fn available<M: Message>(&self) -> usize {
+        self.stream.available::<M>()
+    }
+
     /// Writes out as many bytes from the send buffer as possible, until blocking would start.
     ///
-    /// Returns whether more data remains queued for writing. Encountering an error here means the
-    /// connection must be discarded.
+    /// Returns whether more write work is available immediately (without blocking). Encountering an
+    /// error here means the connection must be discarded.
     pub fn write(
         &mut self,
         now: Instant,
         registry: &Registry,
         token: Token,
-    ) -> io::Result<io::Result<()>> {
+    ) -> io::Result<io::Result<bool>> {
         match self.stream.write(now) {
-            Ok(true) => Ok(Ok(())),
-            Ok(false) => {
+            Ok(WriteResult::Done) => {
                 registry.reregister(self.stream.as_source(), token, Interest::READABLE)?;
-                Ok(Ok(()))
+                Ok(Ok(false))
             }
+            Ok(WriteResult::WouldBlock) => Ok(Ok(false)),
+            Ok(WriteResult::BudgetExceeded) => Ok(Ok(true)),
             Err(err) => Ok(Err(err)),
         }
     }

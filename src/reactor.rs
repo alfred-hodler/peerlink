@@ -306,7 +306,7 @@ where
                         match connection_manager.get_by_peer_id(&peer) {
                             Some(connection) => {
                                 if !connection.queue_message(&message, poll.registry())? {
-                                    sender.send(Event::SendBufferFull { peer, message });
+                                    sender.send(Event::QueueRejected { peer, message });
                                     log::debug!("message: send buffer for peer {peer} is full");
                                 }
                             }
@@ -412,6 +412,7 @@ where
             };
 
             let mut read_carryover = false;
+            let mut write_carryover = false;
 
             if is_readable {
                 log::trace!("readable: peer {peer}");
@@ -455,21 +456,28 @@ where
                 // we are either just connected or just ready to write
                 log::trace!("writeable: peer {peer}");
 
-                if let Err(err) = connection.write(now, poll.registry(), token)? {
-                    log::debug!("write: peer {peer}: IO error: {err}");
-
-                    connection_manager.disconnect(&peer, poll.registry(), now)?;
-
-                    sender.send(Event::Disconnected {
-                        peer,
-                        reason: DisconnectReason::Error(err),
-                    });
+                match connection.write(now, poll.registry(), token)? {
+                    Ok(carryover) => {
+                        write_carryover = carryover;
+                        if config.stream_config.notify_on_transmit {
+                            let available = connection.available::<M>();
+                            sender.send(Event::Transmitted { peer, available });
+                        }
+                    }
+                    Err(err) => {
+                        log::debug!("write: peer {peer}: IO error: {err}");
+                        connection_manager.disconnect(&peer, poll.registry(), now)?;
+                        sender.send(Event::Disconnected {
+                            peer,
+                            reason: DisconnectReason::Error(err),
+                        });
+                    }
                 }
             }
 
             Ok(scheduler::Carryover {
                 r: read_carryover,
-                w: false,
+                w: write_carryover,
             })
         })?;
 

@@ -35,6 +35,12 @@ pub struct StreamConfig {
     /// The duration after which a connect attempt is abandoned. Applies only to non-blocking
     /// connect attempts. Blocking ones performed in custom connectors ignore this value.
     pub connect_timeout: std::time::Duration,
+
+    /// Whether an event should be emitted every time data leaves the send buffer. This event
+    /// contains information on how much data can be queued without rejection in that moment. Useful
+    /// for fine-grained backpressure control.
+    /// The event emitted is [`Event::Transmitted`](super::Event::Transmitted).
+    pub notify_on_transmit: bool,
 }
 
 /// A deferred size expressed as a multiple of the protocol's maximum message size
@@ -60,6 +66,7 @@ impl Default for StreamConfig {
             tx_buf_max_size: MaxMessageSizeMultiple(NonZeroU8::new(2).unwrap()),
             tx_timeout: std::time::Duration::from_secs(30),
             connect_timeout: std::time::Duration::from_secs(5),
+            notify_on_transmit: false,
         }
     }
 }
@@ -176,14 +183,18 @@ impl<T: Read + Write> MessageStream<T> {
         read_result
     }
 
-    /// Writes out as many bytes from the send buffer as possible, until blocking would start.
+    /// Writes out as many bytes from the send buffer as possible, until blocking would start or
+    /// some write budget is exceeded.
     ///
-    /// Returns whether more data remains queued for writing.
+    /// Returns the status of the write.
     #[must_use]
-    pub fn write(&mut self, now: Instant) -> io::Result<bool> {
+    pub fn write(&mut self, now: Instant) -> io::Result<WriteResult> {
         if !self.has_queued_data() {
-            return Ok(false);
+            return Ok(WriteResult::Done);
         }
+
+        let mut write_budget: usize = 128 * 1024;
+        let mut syscall_budget: u8 = 8;
 
         loop {
             match self.try_write(now) {
@@ -192,19 +203,26 @@ impl<T: Read + Write> MessageStream<T> {
                     log::trace!("wrote out {written} bytes, has more: {}", has_more);
 
                     if !has_more {
-                        break Ok(false);
+                        break Ok(WriteResult::Done);
+                    } else {
+                        write_budget = write_budget.saturating_sub(written);
+                        syscall_budget -= 1;
+                        if write_budget == 0 || syscall_budget == 0 {
+                            break Ok(WriteResult::BudgetExceeded);
+                        }
                     }
                 }
 
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     log::trace!("write would block");
-                    break Ok(self.has_queued_data());
+                    break Ok(WriteResult::WouldBlock);
                 }
 
                 Err(err) => break Err(err),
             }
         }
     }
+
     /// Queues a message for sending. This method simply encodes the message and places it into
     /// the internal buffer. [`write`] must be called when the socket is writeable in order to flush.
     ///
@@ -227,6 +245,12 @@ impl<T: Read + Write> MessageStream<T> {
             self.tx_queue_points.append(encoded);
             true
         }
+    }
+
+    /// Returns how many bytes can be queued immediately with respect to transmit buffer size limit.
+    pub fn available<M: Message>(&self) -> usize {
+        let max_size = self.config.tx_buf_max_size.compute::<M>();
+        max_size - self.tx_msg_buf.len()
     }
 
     /// Returns whether the stream is stale on the write side, i.e. the data is not leaving the
@@ -270,6 +294,15 @@ impl<T: Read + Write> MessageStream<T> {
     pub fn has_queued_data(&self) -> bool {
         !self.tx_msg_buf.is_empty()
     }
+}
+
+pub enum WriteResult {
+    /// The write job is done and no more data remains queued.
+    Done,
+    /// More data remains queued but the write would block.
+    WouldBlock,
+    /// More data remains queued but the write budget has been exceeded.
+    BudgetExceeded,
 }
 
 fn decode_from_buffer<M: Message, F: Fn(M, usize)>(
@@ -545,5 +578,23 @@ mod test {
         connection.write(Instant::now()).unwrap();
         assert_eq!(wire.position(), buffer_len as u64);
         assert_eq!(wire.into_inner(), cloned_buffer);
+    }
+
+    #[test]
+    fn outbound_buffer_availability() {
+        let mut wire = Cursor::new(Vec::<u8>::new());
+        let config = StreamConfig {
+            tx_buf_min_size: 1,
+            tx_buf_max_size: MaxMessageSizeMultiple(1.try_into().unwrap()),
+            ..Default::default()
+        };
+        let mut connection = MessageStream::new(&mut wire, config);
+
+        assert!(connection.queue_message(&Ping(0)));
+        assert!(!connection.queue_message(&Ping(1)));
+
+        assert_eq!(connection.available::<Ping>(), 0);
+        connection.write(Instant::now()).unwrap();
+        assert_eq!(connection.available::<Ping>(), 8);
     }
 }

@@ -59,6 +59,10 @@ fn server() -> std::io::Result<()> {
     // Create the reactor and get its handle.
     let handle = peerlink::run::<_>(Config {
         bind_addr: vec![bind_addr],
+        stream_config: peerlink::StreamConfig {
+            notify_on_transmit: true,
+            ..Default::default()
+        },
         ..Default::default()
     })?;
 
@@ -92,6 +96,9 @@ fn server() -> std::io::Result<()> {
                 }
             },
 
+            Event::Transmitted { available, .. } => {
+                println!("Server transmitted, available={}", available);
+            }
             _ => {}
         }
     }
@@ -115,6 +122,7 @@ fn client() -> std::io::Result<()> {
             println!("Connected to server at {}", target);
             peer_id
         }
+
         event => panic!("Unexpected event: {:?}", event),
     };
 
@@ -123,8 +131,8 @@ fn client() -> std::io::Result<()> {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
 
-        handle.send(Command::Message(peer_id, Message::Ping(ping)))?;
         println!("Sending a ping: value={}", ping);
+        handle.send(Command::Message(peer_id, Message::Ping(ping)))?;
 
         match handle.receive_blocking()? {
             Event::Message {

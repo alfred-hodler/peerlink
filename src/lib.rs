@@ -105,6 +105,7 @@ pub trait Message: std::fmt::Debug + Sized + Send + Sync + 'static {
 }
 
 /// Possible reasons why a message could not be decoded at a particular time.
+#[derive(Debug)]
 pub enum DecodeError {
     /// There is not enough data available to reconstruct a message. This does not indicate an
     /// irrecoverable problem, it just means that not enough data has been taken of the wire yet
@@ -183,6 +184,7 @@ pub enum Event<M: Message> {
         /// The result of the connection attempt. A peer id is returned if successful.
         result: io::Result<PeerId>,
     },
+
     /// The reactor received a connection from a remote peer.
     ConnectedFrom {
         /// The peer associated with the event.
@@ -192,6 +194,7 @@ pub enum Event<M: Message> {
         /// The address of the local interface that accepted the connection.
         interface: SocketAddr,
     },
+
     /// A peer disconnected.
     Disconnected {
         /// The peer associated with the event.
@@ -199,6 +202,7 @@ pub enum Event<M: Message> {
         /// The reason the peer left.
         reason: DisconnectReason,
     },
+
     /// A peer produced a message.
     Message {
         /// The peer associated with the event.
@@ -208,16 +212,25 @@ pub enum Event<M: Message> {
         /// The original wire size of the message before it was decoded.
         size: usize,
     },
+
     /// No peer exists with the specified id. Sent when an operation was specified using a peer id
     /// that is not present in the reactor.
     NoPeer(PeerId),
-    /// The send buffer associated with the peer is full. It means the peer is probably not
-    /// reading data from the wire in a timely manner.
-    SendBufferFull {
+
+    /// The send buffer associated with the peer has less space available than the queued message.
+    QueueRejected {
         /// The peer associated with the event.
         peer: PeerId,
-        /// The message that could not be sent to the peer.
+        /// The message that could not be queued.
         message: M,
+    },
+
+    /// Some data has left the send buffer for a peer. This is only emitted if config enabled.
+    Transmitted {
+        /// The peer associated with the event.
+        peer: PeerId,
+        /// The number of bytes that can be queued without triggering a rejection.
+        available: usize,
     },
 }
 
