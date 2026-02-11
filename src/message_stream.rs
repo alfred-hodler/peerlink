@@ -80,9 +80,9 @@ pub struct MessageStream<T: Read + Write> {
     /// The read+write stream underlying the connection.
     stream: T,
     /// Buffer used for message reconstruction.
-    rx_msg_buf: Vec<u8>,
+    rx_msg_buf: readbuf::ReadBuf,
     /// Buffer used for sending.
-    tx_msg_buf: Vec<u8>,
+    tx_msg_buf: readbuf::ReadBuf,
     /// The list of queue points for outgoing messages.
     tx_queue_points: queue_points::Queue,
     /// Cached readyness.
@@ -112,8 +112,8 @@ impl<T: Read + Write> MessageStream<T> {
     pub fn new(stream: T, config: StreamConfig) -> Self {
         Self {
             stream,
-            rx_msg_buf: Vec::new(),
-            tx_msg_buf: Vec::new(),
+            rx_msg_buf: Default::default(),
+            tx_msg_buf: Default::default(),
             tx_queue_points: Default::default(),
             ready: false,
             last_write: Instant::now(),
@@ -127,7 +127,6 @@ impl<T: Read + Write> MessageStream<T> {
     /// Attempts to read from a connection and decode messages in a fair manner.
     ///
     /// Returns whether there is more work available.
-    #[must_use]
     pub fn read<M: Message, F: Fn(M, usize)>(
         &mut self,
         rx_buf: &mut [u8],
@@ -146,7 +145,7 @@ impl<T: Read + Write> MessageStream<T> {
             let result = loop {
                 match self.stream.read(&mut buffer[total_read..]) {
                     // there is maybe more to read but our buffer was already full
-                    Ok(0) if buffer.len() == 0 => break Ok(true),
+                    Ok(0) if buffer.is_empty() => break Ok(true),
                     // buffer was not full and we simply reached the end of stream
                     Ok(0) => break Err(ReadError::EndOfStream),
                     // regular nonzero read
@@ -167,16 +166,20 @@ impl<T: Read + Write> MessageStream<T> {
 
         // for now we always decode as much as we can so we don't care about this result
         let _decode_has_more = if !preexisting {
-            let (consumed, result) = decode_from_buffer(&mut rx_buf[..total_read], on_msg)?;
+            let (consumed, result) = decode_from_buffer(&rx_buf[..total_read], on_msg)?;
             if consumed < total_read {
-                self.rx_msg_buf
-                    .extend_from_slice(&rx_buf[consumed..total_read]);
+                self.rx_msg_buf.put(&rx_buf[consumed..total_read]);
             }
             result
         } else {
-            self.rx_msg_buf.extend_from_slice(&rx_buf[..total_read]);
-            let (consumed, result) = decode_from_buffer(&mut &mut self.rx_msg_buf[..], on_msg)?;
-            self.rx_msg_buf.drain(..consumed);
+            self.rx_msg_buf.put(&rx_buf[..total_read]);
+            let (consumed, result) = decode_from_buffer(self.rx_msg_buf.data(), on_msg)?;
+            self.rx_msg_buf.advance(consumed);
+            if self.rx_msg_buf.is_empty() {
+                self.rx_msg_buf.clear();
+            } else {
+                self.rx_msg_buf.smart_shift();
+            }
             result
         };
 
@@ -187,7 +190,6 @@ impl<T: Read + Write> MessageStream<T> {
     /// some write budget is exceeded.
     ///
     /// Returns the status of the write.
-    #[must_use]
     pub fn write(&mut self, now: Instant) -> io::Result<WriteResult> {
         if !self.has_queued_data() {
             return Ok(WriteResult::Done);
@@ -203,6 +205,7 @@ impl<T: Read + Write> MessageStream<T> {
                     log::trace!("wrote out {written} bytes, has more: {}", has_more);
 
                     if !has_more {
+                        self.tx_msg_buf.clear();
                         break Ok(WriteResult::Done);
                     } else {
                         write_budget = write_budget.saturating_sub(written);
@@ -233,15 +236,16 @@ impl<T: Read + Write> MessageStream<T> {
     /// determine whether the message will be accepted into the send buffer. If a message does
     /// not have a size hint, two scenarios exist:
     ///   - The buffer is not full -- the message is encoded and placed into the buffer even if
-    ///        that will exceed its maximum size and push it past the configured limits.
+    ///     that will exceed its maximum size and push it past the configured limits.
     ///   - The buffer is full -- the message will not be encoded and queued.
     #[must_use]
     pub fn queue_message<M: Message>(&mut self, message: &M) -> bool {
+        self.tx_msg_buf.smart_shift();
         let size_hint = message.size_hint().unwrap_or_default();
         if size_hint + self.tx_msg_buf.len() >= self.config.tx_buf_max_size.compute::<M>() {
             false
         } else {
-            let encoded = message.encode(&mut self.tx_msg_buf);
+            let encoded = message.encode(self.tx_msg_buf.as_writer());
             self.tx_queue_points.append(encoded);
             true
         }
@@ -267,22 +271,16 @@ impl<T: Read + Write> MessageStream<T> {
     /// large receive buffers (e.g. after receiving a large message) would eventually exhaust
     /// available memory on less powerful devices when managing many peers.
     pub fn shrink_buffers(&mut self) {
-        fn shrink(v: &mut Vec<u8>, min: usize) {
-            if v.capacity() > min {
-                let shrink_to = 3 * (v.capacity() / 4);
-                v.shrink_to(min.max(shrink_to));
-            }
-        }
-        shrink(&mut self.rx_msg_buf, self.config.rx_buf_min_size);
-        shrink(&mut self.tx_msg_buf, self.config.tx_buf_min_size);
+        self.rx_msg_buf.shrink(self.config.rx_buf_min_size);
+        self.tx_msg_buf.shrink(self.config.tx_buf_min_size);
         self.tx_queue_points.shrink();
     }
 
-    /// Takes some bytes from the local send buffer and sends them. Removes successfully sent bytes
-    /// from the buffer. Returns the number of bytes sent.
+    /// Takes some bytes from the local send buffer and sends them.
+    /// Returns the number of bytes sent.
     fn try_write(&mut self, now: Instant) -> io::Result<usize> {
-        let written = self.stream.write(&self.tx_msg_buf)?;
-        self.tx_msg_buf.drain(..written);
+        let written = self.stream.write(self.tx_msg_buf.data())?;
+        self.tx_msg_buf.advance(written);
         self.stream.flush()?;
         self.last_write = now;
         self.tx_queue_points.mark_write(written);
@@ -306,7 +304,7 @@ pub enum WriteResult {
 }
 
 fn decode_from_buffer<M: Message, F: Fn(M, usize)>(
-    buffer: &mut [u8],
+    buffer: &[u8],
     on_msg: F,
 ) -> Result<(usize, bool), ReadError> {
     let mut cursor: usize = 0;
@@ -444,6 +442,125 @@ mod queue_points {
     }
 }
 
+mod readbuf {
+    /// A buffer implementation that enables multiple, individual reads to happen without having
+    /// to clear the read data from the head. This can be done lazily when opportune instead.
+    #[derive(Debug, Default)]
+    pub struct ReadBuf {
+        buf: Vec<u8>,
+        cursor: usize,
+    }
+
+    impl ReadBuf {
+        /// Returns the view of data that has not been read yet.
+        pub fn data(&self) -> &[u8] {
+            &self.buf[self.cursor..]
+        }
+
+        /// Returns the length of the data that has not been read yet.
+        #[inline(always)]
+        pub fn len(&self) -> usize {
+            self.buf.len() - self.cursor
+        }
+
+        /// Returns the number of unread elements in the buffer.
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        /// Advances the read cursor forward, consuming bytes.
+        pub fn advance(&mut self, n: usize) {
+            self.cursor += n;
+            assert!(self.cursor <= self.buf.len());
+        }
+
+        /// Clears the entire buffer and resets the read cursor.
+        pub fn clear(&mut self) {
+            self.buf.clear();
+            self.cursor = 0;
+        }
+
+        /// Moves the yet unread data forward, discarding any previously read data.
+        /// This operation only has an effect if the "junk" (already consumed) data takes up more
+        /// than one third of space in the buffer.
+        pub fn smart_shift(&mut self) {
+            if self.cursor > 0 && !self.buf.is_empty() && self.cursor >= self.buf.len() / 3 {
+                self.shift();
+            }
+        }
+
+        /// Shrinks the buffer by one third, with respect to some floor.
+        pub fn shrink(&mut self, min: usize) {
+            if self.cursor > 0 {
+                self.shift();
+            }
+
+            if self.buf.capacity() > min {
+                let shrink_to = 3 * (self.buf.capacity() / 4);
+                self.buf.shrink_to(min.max(shrink_to));
+            }
+        }
+
+        /// Exposes the buffer as [`std::io::Write`].
+        pub fn as_writer(&mut self) -> &mut impl std::io::Write {
+            &mut self.buf
+        }
+
+        pub fn put(&mut self, data: &[u8]) {
+            self.buf.extend_from_slice(data);
+        }
+
+        /// Moves the yet unread data forward, discarding any previously read data.
+        fn shift(&mut self) {
+            self.buf.copy_within(self.cursor.., 0);
+            self.buf.truncate(self.buf.len() - self.cursor);
+            self.cursor = 0;
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn buffer_test() {
+        use std::io::Write;
+        let mut buffer = ReadBuf::default();
+
+        assert_eq!(buffer.len(), 0);
+
+        buffer.as_writer().write(b"test 123").unwrap();
+        assert_eq!(buffer.len(), 8);
+        assert_eq!(buffer.data(), b"test 123");
+
+        buffer.advance(5);
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer.data(), b"123");
+        assert_eq!(buffer.buf, b"test 123");
+
+        buffer.shift();
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer.data(), b"123");
+        assert_eq!(buffer.buf, b"123");
+
+        buffer.shift(); // this one is a no-op
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer.data(), b"123");
+        assert_eq!(buffer.buf, b"123");
+
+        buffer.advance(3);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.data(), b"");
+        assert_eq!(buffer.buf, b"123");
+
+        buffer.shift();
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.data(), b"");
+        assert_eq!(buffer.buf, b"");
+
+        assert_eq!(buffer.buf.capacity(), 8);
+        buffer.shrink(4);
+        assert!(buffer.buf.capacity() >= 4 && buffer.buf.capacity() < 8);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::cell::RefCell;
@@ -554,7 +671,7 @@ mod test {
         assert!(connection.queue_message(&Ping(1)));
         assert!(connection.queue_message(&Ping(2)));
 
-        let cloned_buffer = connection.tx_msg_buf.clone();
+        let cloned_buffer = connection.tx_msg_buf.data().to_vec();
         connection.write(Instant::now()).unwrap();
         assert_eq!(wire.position(), 24);
         assert_eq!(wire.into_inner(), cloned_buffer);
@@ -574,7 +691,7 @@ mod test {
         assert!(!connection.queue_message(&Ping(1)));
 
         let buffer_len = connection.tx_msg_buf.len();
-        let cloned_buffer = connection.tx_msg_buf.clone();
+        let cloned_buffer = connection.tx_msg_buf.data().to_vec();
         connection.write(Instant::now()).unwrap();
         assert_eq!(wire.position(), buffer_len as u64);
         assert_eq!(wire.into_inner(), cloned_buffer);

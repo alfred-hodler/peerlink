@@ -388,10 +388,8 @@ impl Manager {
                     _ => true,
                 };
 
-                if !retain {
-                    if let Err(err) = registry.deregister(connection.stream.as_source()) {
-                        deregister_error = Err(err);
-                    }
+                if !retain && let Err(err) = registry.deregister(connection.stream.as_source()) {
+                    deregister_error = Err(err);
                 }
 
                 retain
