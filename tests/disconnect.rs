@@ -12,7 +12,7 @@ use common::Message;
 enum LeaveType {
     Disconnect(PeerId),
     Shutdown,
-    Panic,
+    Abrupt,
 }
 
 #[test]
@@ -27,7 +27,7 @@ fn client_shutdown_leave() {
 
 #[test]
 fn client_abrupt_leave() {
-    shutdown_test(8002, LeaveType::Panic, true);
+    shutdown_test(8002, LeaveType::Abrupt, true);
 }
 
 #[test]
@@ -42,7 +42,7 @@ fn server_shutdown_leave() {
 
 #[test]
 fn server_abrupt_leave() {
-    shutdown_test(8005, LeaveType::Panic, false);
+    shutdown_test(8005, LeaveType::Abrupt, false);
 }
 
 fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool) {
@@ -89,9 +89,7 @@ fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool
         LeaveType::Shutdown => {
             leaving.shutdown().unwrap();
         }
-        LeaveType::Panic => {
-            leaving.panic().unwrap();
-        }
+        LeaveType::Abrupt => drop(leaving),
     }
 
     assert!(matches!(
