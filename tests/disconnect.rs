@@ -67,12 +67,12 @@ fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool
     client_handle.send(Command::connect(server_addr)).unwrap();
 
     assert!(matches!(
-        client_handle.receive_blocking().unwrap(),
+        client_handle.recv_blocking().unwrap(),
         Event::ConnectedTo { .. }
     ));
 
     assert!(matches!(
-        server_handle.receive_blocking().unwrap(),
+        server_handle.recv_blocking().unwrap(),
         Event::ConnectedFrom { .. }
     ));
 
@@ -87,13 +87,13 @@ fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool
             leaving.send(Command::Disconnect(peer_id)).unwrap();
         }
         LeaveType::Shutdown => {
-            leaving.shutdown().unwrap();
+            leaving.shutdown().1.unwrap();
         }
         LeaveType::Abrupt => drop(leaving),
     }
 
     assert!(matches!(
-        remaining.receive_blocking().unwrap(),
+        remaining.recv_blocking().unwrap(),
         Event::Disconnected {
             reason: DisconnectReason::Left,
             ..

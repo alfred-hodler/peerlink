@@ -51,7 +51,7 @@ impl peerlink::Message for Message {
 }
 
 // The server consists of a reactor listening to events in a loop and replying to pings with pongs.
-fn server() -> std::io::Result<()> {
+fn server() -> Result<(), Error> {
     // Define the listen address for inbound peers to connect to.
     let bind_addr = "127.0.0.1:8080".parse().unwrap();
     println!("Server: starting to listen on address {}", bind_addr);
@@ -68,7 +68,7 @@ fn server() -> std::io::Result<()> {
 
     // Start processing events.
     loop {
-        match handle.receive_blocking().unwrap() {
+        match handle.recv_blocking().unwrap() {
             Event::ConnectedFrom { peer, addr, .. } => {
                 println!("Inbound peer connect: peer_id={} ip={}", peer, addr);
             }
@@ -106,7 +106,7 @@ fn server() -> std::io::Result<()> {
 
 // The client consists of a reactor connecting to a server and periodically sending out pings until
 // the server disappears.
-fn client() -> std::io::Result<()> {
+fn client() -> Result<(), Error> {
     // Create the reactor and get its handle.
     let handle = peerlink::run(Config::default())?;
 
@@ -114,7 +114,7 @@ fn client() -> std::io::Result<()> {
     let server_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     handle.send(Command::connect(server_addr))?;
 
-    let peer_id = match handle.receive_blocking()? {
+    let peer_id = match handle.recv_blocking()? {
         Event::ConnectedTo {
             target,
             result: Ok(peer_id),
@@ -134,7 +134,7 @@ fn client() -> std::io::Result<()> {
         println!("Sending a ping: value={}", ping);
         handle.send(Command::Message(peer_id, Message::Ping(ping)))?;
 
-        match handle.receive_blocking()? {
+        match handle.recv_blocking()? {
             Event::Message {
                 message: Message::Pong(pong),
                 ..
@@ -154,7 +154,7 @@ fn client() -> std::io::Result<()> {
     }
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), Error> {
     env_logger::init();
 
     match std::env::args().nth(1).as_deref() {
@@ -164,5 +164,31 @@ fn main() -> std::io::Result<()> {
             eprintln!("The first arg must be either 'client' or 'server'");
             Ok(())
         }
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum Error {
+    Io(std::io::Error),
+    Send(peerlink::SendError),
+    Recv(peerlink::RecvError),
+}
+
+impl From<peerlink::SendError> for Error {
+    fn from(value: peerlink::SendError) -> Self {
+        Self::Send(value)
+    }
+}
+
+impl From<peerlink::RecvError> for Error {
+    fn from(value: peerlink::RecvError) -> Self {
+        Self::Recv(value)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
     }
 }

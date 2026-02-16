@@ -17,7 +17,7 @@ fn client_connects_to_nonexistent() {
 
     let _ = client_handle.send(peerlink::Command::connect(server_addr));
 
-    let connected: Event<_> = client_handle.receive_blocking().unwrap();
+    let connected: Event<_> = client_handle.recv_blocking().unwrap();
     assert!(matches!(
         connected,
         Event::ConnectedTo { result: Err(err), .. } if err.kind() == ErrorKind::ConnectionRefused

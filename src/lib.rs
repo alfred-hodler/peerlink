@@ -19,7 +19,7 @@ use std::{io, net::SocketAddr, num::NonZeroUsize};
 use crate::connector::Target;
 
 pub use message_stream::StreamConfig;
-pub use reactor::{Handle, run, run_with_connector};
+pub use reactor::{Handle, RecvError, SendError, run, run_with_connector};
 
 #[cfg(feature = "socks")]
 pub use reactor::run_with_socks5_proxy;

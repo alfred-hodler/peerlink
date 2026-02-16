@@ -21,9 +21,9 @@ fn interleaved() {
 
     for nonce in 0..1000 {
         message(&client, server_peer, Message::Ping(nonce));
-        expect_ping(server.receive_blocking().unwrap(), nonce);
+        expect_ping(server.recv_blocking().unwrap(), nonce);
         message(&server, client_peer, Message::Pong(nonce));
-        expect_pong(client.receive_blocking().unwrap(), nonce);
+        expect_pong(client.recv_blocking().unwrap(), nonce);
     }
 }
 
@@ -47,10 +47,10 @@ fn stuff_messages() {
     client.send(Command::Disconnect(server_peer)).unwrap();
 
     for i in 0..1000 {
-        expect_ping(server.receive_blocking().unwrap(), i);
+        expect_ping(server.recv_blocking().unwrap(), i);
     }
 
-    match server.receive_blocking().unwrap() {
+    match server.recv_blocking().unwrap() {
         peerlink::Event::Disconnected {
             reason: DisconnectReason::Left,
             ..
@@ -80,8 +80,8 @@ fn batches() {
     }
 
     for i in 0..1000 {
-        expect_ping(server.receive_blocking().unwrap(), i);
-        expect_ping(client.receive_blocking().unwrap(), i);
+        expect_ping(server.recv_blocking().unwrap(), i);
+        expect_ping(client.recv_blocking().unwrap(), i);
     }
 }
 
@@ -120,10 +120,10 @@ fn many_to_one_interleaved() {
     for nonce in 0..100 {
         for (i, c) in clients.iter().enumerate() {
             message(c, PeerId::set_raw(0), Message::Ping(nonce));
-            let ping_from_peer = expect_ping(server.receive_blocking().unwrap(), nonce);
+            let ping_from_peer = expect_ping(server.recv_blocking().unwrap(), nonce);
             assert_eq!(ping_from_peer, PeerId::set_raw(i as u64));
             message(&server, ping_from_peer, Message::Pong(nonce));
-            expect_pong(c.receive_blocking().unwrap(), nonce);
+            expect_pong(c.recv_blocking().unwrap(), nonce);
         }
     }
 }
@@ -170,20 +170,20 @@ fn many_to_one_bulk() {
 
     // no guarantee that the server is processing every peer sequentially
     for _ in 0..(clients.len() * n_pings as usize) {
-        let (peer, nonce) = read_ping(server.receive_blocking().unwrap());
+        let (peer, nonce) = read_ping(server.recv_blocking().unwrap());
         message(&server, peer, Message::Pong(nonce));
     }
 
-    assert_eq!(server.receiver().len(), 0);
+    assert_eq!(server.event_count(), 0);
 
     for nonce in 0..100 {
         for c in &clients {
-            expect_pong(c.receive_blocking().unwrap(), nonce);
+            expect_pong(c.recv_blocking().unwrap(), nonce);
         }
     }
 
     for c in &clients {
-        assert_eq!(c.receiver().len(), 0);
+        assert_eq!(c.event_count(), 0);
     }
 }
 
@@ -202,7 +202,7 @@ fn very_large() {
 
     client.send(Command::Message(client_peer, message)).unwrap();
 
-    match server.receive_blocking().unwrap() {
+    match server.recv_blocking().unwrap() {
         Event::Message {
             message: Message::Data(data),
             size,
@@ -278,7 +278,7 @@ fn connect(
 ) -> (PeerId, PeerId) {
     client.send(Command::connect(server_addr)).unwrap();
 
-    let client_peer = match server.receive_blocking().unwrap() {
+    let client_peer = match server.recv_blocking().unwrap() {
         peerlink::Event::ConnectedFrom { peer, .. } => {
             println!("server: client has connected");
             peer
@@ -286,7 +286,7 @@ fn connect(
         _ => panic!(),
     };
 
-    let server_peer = match client.receive_blocking().unwrap() {
+    let server_peer = match client.recv_blocking().unwrap() {
         peerlink::Event::ConnectedTo {
             result: Ok(peer), ..
         } => {
@@ -302,7 +302,7 @@ fn connect(
 fn disconnect(client: &Handle<Message>, server: &Handle<Message>, server_peer: PeerId) -> PeerId {
     client.send(Command::Disconnect(server_peer)).unwrap();
 
-    let client_that_left = match server.receive_blocking().unwrap() {
+    let client_that_left = match server.recv_blocking().unwrap() {
         peerlink::Event::Disconnected {
             peer,
             reason: DisconnectReason::Left,
@@ -313,7 +313,7 @@ fn disconnect(client: &Handle<Message>, server: &Handle<Message>, server_peer: P
         _ => panic!(),
     };
 
-    match client.receive_blocking().unwrap() {
+    match client.recv_blocking().unwrap() {
         peerlink::Event::Disconnected {
             peer,
             reason: DisconnectReason::Requested,

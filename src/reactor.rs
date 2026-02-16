@@ -17,7 +17,7 @@ use crossbeam_channel::{Receiver, Sender};
 #[cfg(feature = "async")]
 use async_channel::{Receiver, Sender};
 
-pub use handle::Handle;
+pub use handle::{Handle, RecvError, SendError};
 
 mod connection;
 mod handle;
