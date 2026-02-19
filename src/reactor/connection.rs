@@ -96,6 +96,18 @@ impl Connection {
             Err(err) => Ok(Err(err)),
         }
     }
+
+    /// Utility function that returns a peer if for a connection, if one has been established.
+    fn peer_id(&self) -> Option<PeerId> {
+        match &self.direction {
+            Direction::Inbound { peer } => Some(*peer),
+            Direction::Outbound {
+                state: State::Connected { peer },
+                ..
+            } => Some(*peer),
+            _ => None,
+        }
+    }
 }
 
 /// The state of a connection for outside observation.
@@ -125,8 +137,7 @@ pub enum Dead {
 /// Handles and tracks connections.
 pub struct Manager {
     connections: Slab<Connection>,
-    token_map: hashbrown::HashMap<PeerId, Token>,
-    next_peer_id: PeerId,
+    next_seq: u64,
     dead: Vec<Dead>,
     last_buffer_resize: Instant,
     last_cleanup: Instant,
@@ -137,8 +148,7 @@ impl Manager {
     pub fn new() -> Self {
         Self {
             connections: Slab::with_capacity(16),
-            token_map: hashbrown::HashMap::with_capacity(16),
-            next_peer_id: PeerId(0),
+            next_seq: 0,
             dead: Vec::with_capacity(8),
             last_buffer_resize: Instant::now(),
             last_cleanup: Instant::now(),
@@ -147,10 +157,12 @@ impl Manager {
 
     /// Returns a connection by peer id, if such a peer id is known.
     pub fn get_by_peer_id(&mut self, peer: &PeerId) -> Option<&mut Connection> {
-        self.token_map.get_mut(peer).map(|token| {
-            self.connections
-                .get_mut(token.0)
-                .expect("get: token -> connection must exist")
+        self.connections.get_mut(peer.token.0).and_then(|c| {
+            if c.peer_id().as_ref() == Some(peer) {
+                Some(c)
+            } else {
+                None
+            }
         })
     }
 
@@ -199,10 +211,11 @@ impl Manager {
                     } else {
                         log::debug!("stream ready: {:?}", connection.direction);
 
-                        let peer = self.next_peer_id;
-                        let prev_mapping = self.token_map.insert(peer, *token);
-                        assert!(prev_mapping.is_none());
-                        self.next_peer_id = self.next_peer_id.next();
+                        let peer = PeerId {
+                            token: *token,
+                            seq: self.next_seq,
+                        };
+                        self.next_seq += 1;
                         let target = target.clone();
 
                         connection.direction = Direction::Outbound {
@@ -269,10 +282,11 @@ impl Manager {
 
         registry.register(&mut stream, token, Interest::READABLE)?;
 
-        let peer = self.next_peer_id;
-        let prev_mapping = self.token_map.insert(peer, token);
-        assert!(prev_mapping.is_none());
-        self.next_peer_id = self.next_peer_id.next();
+        let peer = PeerId {
+            token,
+            seq: self.next_seq,
+        };
+        self.next_seq += 1;
 
         vacancy.insert(Connection {
             stream: MessageStream::new(stream, stream_cfg),
@@ -290,28 +304,24 @@ impl Manager {
         registry: &Registry,
         now: Instant,
     ) -> io::Result<bool> {
-        match self.token_map.remove(peer) {
-            Some(token) => {
-                let mut connection = self
-                    .connections
-                    .try_remove(token.0)
-                    .expect("disconnect: token -> connection must exist");
-                registry.deregister(connection.stream.as_source())?;
-                let _ = connection.stream.write(now);
-                let _ = connection.stream.shutdown();
-                Ok(true)
-            }
-            None => Ok(false),
+        let exists = self
+            .connections
+            .get(peer.token.0)
+            .is_some_and(|c| c.peer_id().as_ref() == Some(peer));
+
+        if exists {
+            let mut connection = self.connections.remove(peer.token.0);
+            registry.deregister(connection.stream.as_source())?;
+            let _ = connection.stream.write(now);
+            let _ = connection.stream.shutdown();
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
     /// Performs internal housekeeping if necessary.
-    pub fn compact<F: FnMut(Token, Token)>(
-        &mut self,
-        now: Instant,
-        registry: &Registry,
-        mut rekey: F,
-    ) -> io::Result<()> {
+    pub fn compact(&mut self, now: Instant) -> io::Result<()> {
         if (now - self.last_buffer_resize).as_secs() > 30 {
             for (_, connection) in &mut self.connections {
                 connection.stream.shrink_buffers();
@@ -319,37 +329,7 @@ impl Manager {
             self.last_buffer_resize = now;
         }
 
-        let mut result = Ok(());
-        let capacity = self.connections.capacity();
-        if capacity > 32 && capacity >= self.connections.len() * 2 {
-            self.connections.compact(|c, from, to| {
-                let (_, entry) = self
-                    .token_map
-                    .iter_mut()
-                    .find(|(_, token)| token.0 == from)
-                    .unwrap();
-                *entry = Token(to);
-
-                c.token = Token(to);
-
-                rekey(Token(from), Token(to));
-
-                let interest = if c.stream.has_queued_data() {
-                    Interest::READABLE | Interest::WRITABLE
-                } else {
-                    Interest::READABLE
-                };
-
-                if let Err(err) = registry.reregister(c.stream.as_source(), Token(to), interest) {
-                    result = Err(err);
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-
-        result
+        Ok(())
     }
 
     /// Removes dead connections and returns an iterator of removal reasons.
@@ -382,7 +362,6 @@ impl Manager {
                         ..
                     } if connection.stream.is_write_stale(now) => {
                         self.dead.push(Dead::WriteStale(*peer));
-                        self.token_map.remove(peer);
                         false
                     }
                     _ => true,

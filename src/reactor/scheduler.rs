@@ -2,6 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use mio::{Events, Poll, Token};
+use rustc_hash::FxHashMap;
 
 /// Reserved token used for waking the event loop.
 pub const WAKER: Token = Token(usize::MAX);
@@ -14,7 +15,7 @@ pub struct Scheduler {
     events: Events,
     has_waker: bool,
     listeners: Vec<Token>,
-    carryover: hashbrown::HashMap<Token, readiness::Readiness>,
+    carryover: FxHashMap<Token, readiness::Readiness>,
     n_listeners: usize,
 }
 
@@ -76,8 +77,8 @@ impl Scheduler {
         round: u64,
         mut f: F,
     ) -> io::Result<()> {
-        use hashbrown::hash_map::Entry;
         use readiness::Readiness;
+        use std::collections::hash_map::Entry;
 
         for event in self
             .events
@@ -147,13 +148,6 @@ impl Scheduler {
         }
 
         result
-    }
-
-    /// Rekeys readiness to a new token. Works only on connections.
-    pub fn rekey(&mut self, from: Token, to: Token) {
-        if let Some(carryover) = self.carryover.remove(&from) {
-            self.carryover.insert(to, carryover);
-        }
     }
 }
 

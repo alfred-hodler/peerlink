@@ -106,22 +106,18 @@ fn many_to_one_interleaved() {
     let n_clients = 5;
 
     let clients: Vec<_> = (0..n_clients)
-        .enumerate()
-        .map(|(i, _)| {
+        .map(|_| {
             let client = peerlink::run(Config::default()).unwrap();
-
-            let (client_peer, _) = connect(&client, &server, server_addr.into());
-            assert_eq!(i as u64, client_peer.inner());
-
-            client
+            let (client_peer, server_peer) = connect(&client, &server, server_addr.into());
+            (client, client_peer, server_peer)
         })
         .collect();
 
     for nonce in 0..100 {
-        for (i, c) in clients.iter().enumerate() {
-            message(c, PeerId::set_raw(0), Message::Ping(nonce));
+        for (c, client_peer, server_peer) in clients.iter() {
+            message(c, *server_peer, Message::Ping(nonce));
             let ping_from_peer = expect_ping(server.recv_blocking().unwrap(), nonce);
-            assert_eq!(ping_from_peer, PeerId::set_raw(i as u64));
+            assert_eq!(ping_from_peer, *client_peer);
             message(&server, ping_from_peer, Message::Pong(nonce));
             expect_pong(c.recv_blocking().unwrap(), nonce);
         }
@@ -151,20 +147,17 @@ fn many_to_one_bulk() {
     let n_pings = 100;
 
     let clients: Vec<_> = (0..n_clients)
-        .enumerate()
-        .map(|(i, _)| {
+        .map(|_| {
             let client = peerlink::run(Config::default()).unwrap();
+            let (client_peer, server_peer) = connect(&client, &server, server_addr.into());
 
-            let (client_peer, _) = connect(&client, &server, server_addr.into());
-            assert_eq!(i as u64, client_peer.inner());
-
-            client
+            (client, client_peer, server_peer)
         })
         .collect();
 
     for nonce in 0..n_pings {
-        for c in &clients {
-            message(c, PeerId::set_raw(0), Message::Ping(nonce));
+        for (c, _client_peer, server_peer) in &clients {
+            message(c, *server_peer, Message::Ping(nonce));
         }
     }
 
@@ -177,12 +170,12 @@ fn many_to_one_bulk() {
     assert_eq!(server.event_count(), 0);
 
     for nonce in 0..100 {
-        for c in &clients {
+        for (c, _, _) in &clients {
             expect_pong(c.recv_blocking().unwrap(), nonce);
         }
     }
 
-    for c in &clients {
+    for (c, _, _) in &clients {
         assert_eq!(c.event_count(), 0);
     }
 }
@@ -233,13 +226,11 @@ fn peer_id_increments() {
 
     let n_clients = 5;
 
-    for i in 0..n_clients {
+    for _ in 0..n_clients {
         let client = peerlink::run(Config::default()).unwrap();
 
-        let (client_peer, _) = connect(&client, &server, server_addr.into());
-        assert_eq!(i as u64, client_peer.inner());
-
-        let client_that_left = disconnect(&client, &server, PeerId::set_raw(0));
+        let (client_peer, server_peer) = connect(&client, &server, server_addr.into());
+        let client_that_left = disconnect(&client, &server, server_peer);
         assert_eq!(client_that_left, client_peer);
     }
 }

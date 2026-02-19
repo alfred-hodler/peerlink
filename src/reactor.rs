@@ -403,9 +403,7 @@ where
             }
         }
 
-        connection_manager.compact(now, poll.registry(), |from, to| {
-            scheduler.rekey(from, to);
-        })?;
+        connection_manager.compact(now)?;
 
         round += 1;
     }

@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use peerlink::{Command, Config, DisconnectReason, Event, PeerId};
+use peerlink::{Command, Config, DisconnectReason, Event};
 
 mod common;
 use common::Message;
@@ -10,14 +10,14 @@ use common::Message;
 // disconnect immediately and without fail.
 
 enum LeaveType {
-    Disconnect(PeerId),
+    Disconnect,
     Shutdown,
     Abrupt,
 }
 
 #[test]
 fn client_orderly_disconnect() {
-    shutdown_test(8000, LeaveType::Disconnect(PeerId::set_raw(0)), true);
+    shutdown_test(8000, LeaveType::Disconnect, true);
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn client_abrupt_leave() {
 
 #[test]
 fn server_orderly_disconnect() {
-    shutdown_test(8003, LeaveType::Disconnect(PeerId::set_raw(0)), false);
+    shutdown_test(8003, LeaveType::Disconnect, false);
 }
 
 #[test]
@@ -66,25 +66,31 @@ fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool
 
     client_handle.send(Command::connect(server_addr)).unwrap();
 
-    assert!(matches!(
-        client_handle.recv_blocking().unwrap(),
-        Event::ConnectedTo { .. }
-    ));
+    let connected_to_server = client_handle.recv_blocking().unwrap();
+    let server_id = match connected_to_server {
+        Event::ConnectedTo {
+            result: Ok(peer), ..
+        } => peer,
+        _ => panic!("unexpected event"),
+    };
 
-    assert!(matches!(
-        server_handle.recv_blocking().unwrap(),
-        Event::ConnectedFrom { .. }
-    ));
+    let connected_from_client = server_handle.recv_blocking().unwrap();
+    let client_id = match connected_from_client {
+        Event::ConnectedFrom { peer, .. } => peer,
+        _ => panic!("unexpected event"),
+    };
 
-    let (leaving, remaining) = if client_is_leaving {
-        (client_handle, server_handle)
+    let (leaving, peer_id_to_disconnect, remaining) = if client_is_leaving {
+        (client_handle, server_id, server_handle)
     } else {
-        (server_handle, client_handle)
+        (server_handle, client_id, client_handle)
     };
 
     match shutdown_command {
-        LeaveType::Disconnect(peer_id) => {
-            leaving.send(Command::Disconnect(peer_id)).unwrap();
+        LeaveType::Disconnect => {
+            leaving
+                .send(Command::Disconnect(peer_id_to_disconnect))
+                .unwrap();
         }
         LeaveType::Shutdown => {
             leaving.shutdown().1.unwrap();
