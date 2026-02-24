@@ -24,3 +24,8 @@ socks = { version = "0.3.4", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11.8"
+pico-args = "0.5"
+
+[[bench]]
+name = "rtt"
+harness = false
