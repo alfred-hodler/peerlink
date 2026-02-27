@@ -18,8 +18,8 @@ use std::{io, net::SocketAddr, num::NonZeroUsize};
 
 use crate::connector::Target;
 
-pub use message_stream::StreamConfig;
-pub use reactor::{Handle, RecvError, SendError, run, run_with_connector};
+pub use message_stream::{MaxMessageSizeMultiple, StreamConfig};
+pub use reactor::{Handle, RecvError, SendError, Termination, run, run_with_connector};
 
 #[cfg(feature = "socks")]
 pub use reactor::run_with_socks5_proxy;
@@ -49,13 +49,11 @@ pub struct Config {
     /// data in one read than the biggest message requires to decode.
     pub receive_buffer_size: usize,
 
-    /// Whether the reactor should perform backpressure control on the receive side. Setting this
-    /// to `Some(n)` means that the reactor will start blocking on sending events to the consumer
-    /// when the receive channel of size `n` is full and events are not being read. Setting it to
-    /// `None` means that the capacity of the event channel is unbounded and the reactor will send
-    /// events to the consumer as fast as it can, regardless of whether those events are being read
-    /// (at all). The default is no backpressure control (`None`).
-    pub receive_channel_size: Option<NonZeroUsize>,
+    /// Controls backpressure control on the receive side. When the event receive channel is full,
+    /// the reactor will internally start blocking on sending events to the consumer until some
+    /// capacity is available. This is to prevent OOM issues (reactor producing messages faster than
+    /// the consumer can handle them).
+    pub receive_channel_size: NonZeroUsize,
 }
 
 impl Default for Config {
@@ -64,7 +62,7 @@ impl Default for Config {
             bind_addr: Default::default(),
             stream_config: Default::default(),
             receive_buffer_size: 1024 * 1024,
-            receive_channel_size: None,
+            receive_channel_size: NonZeroUsize::new(1024).unwrap(),
         }
     }
 }
@@ -76,32 +74,27 @@ pub trait Message: std::fmt::Debug + Sized + Send + Sync + 'static {
     /// large messages. This is also crucial for DoS protection (resource exhaustion attacks).
     const MAX_SIZE: usize;
 
-    /// Encodes a message into a writer. This is an in-memory sink that never panics so there is no
-    /// need to handle the error path.
-    ///
-    /// Returns the number of encoded bytes.
-    fn encode(&self, sink: &mut impl std::io::Write) -> usize;
+    /// Encodes a message into a buffer.
+    fn encode(&self, sink: &mut impl bytes::BufMut);
 
     /// Provides access to the underlying read buffer. The buffer may contain any number of
     /// messages, including no messages at all or only a partial message. If there are enough bytes
-    /// available to decode a message, the function must return an `Ok` with the decoded message and
-    /// the number of bytes it consumed.
+    /// available to decode a message, the function must return an `Ok` with the decoded message.
     ///
     /// If there is not enough data to decode a message (i.e. it is available only partially),
-    /// `Err(DecodeError::NotEnoughData)` must be returned. That signals that decoding should be
+    /// `Err(DecodeError::Partial)` must be returned. That signals that decoding should be
     /// retried when more data comes in. If the message cannot be decoded at all, or exceeds size
-    /// limits or otherwise represents junk data, `Err(DecodeError::MalformedMessage)` must be
+    /// limits or otherwise represents junk data, `Err(DecodeError::Malformed)` must be
     /// returned. Such peers are disconnected as protocol violators.
-    fn decode(buffer: &[u8]) -> Result<(Self, usize), DecodeError>;
+    ///
+    /// If a message is decoded successfully, do not keep reading more from the buffer as that will
+    /// interfere with size reporting.
+    fn decode(buffer: &mut impl bytes::Buf) -> Result<Self, DecodeError>;
 
-    /// If a message has a known size ahead of encoding, that value can be set here. This is useful
-    /// for outbound backpressure control, so that a message is not preemptively encoded and placed
-    /// into the send buffer only to be realized that the size of the send buffer will be exceeding
-    /// its maximum. Getting this wrong can interfere with outbound backpressure control, so if the
-    /// value is not certain, it is better not to override the method.
-    fn size_hint(&self) -> Option<usize> {
-        None
-    }
+    /// The size of the encoded message (serialized size). Setting this correctly is paramount
+    /// for correct backpressure control. Setting this incorrectly will interfere with outbound
+    /// backpressure control.
+    fn wire_size(&self) -> usize;
 }
 
 /// Possible reasons why a message could not be decoded at a particular time.
@@ -110,10 +103,10 @@ pub enum DecodeError {
     /// There is not enough data available to reconstruct a message. This does not indicate an
     /// irrecoverable problem, it just means that not enough data has been taken of the wire yet
     /// and that the operation should be retried once more data comes in.
-    NotEnoughData,
+    Partial,
     /// The message is malformed in some way. Once this is encountered, the peer that sent it
-    /// is disconnected.
-    MalformedMessage,
+    /// is immediately disconnected and the appropriate event is emitted.
+    Malformed,
 }
 
 /// Unique peer identifier. These are unique for the lifetime of the process and strictly
@@ -194,6 +187,8 @@ pub enum Event<M: Message> {
         message: M,
         /// The original wire size of the message before it was decoded.
         size: usize,
+        /// The amount of time it took to receive the whole message (take it off the wire).
+        time: std::time::Duration,
     },
 
     /// No peer exists with the specified id. Sent when an operation was specified using a peer id
@@ -208,12 +203,28 @@ pub enum Event<M: Message> {
         message: M,
     },
 
-    /// Some data has left the send buffer for a peer. This is only emitted if config enabled.
-    Transmitted {
+    /// Telemetry on the outbound data buffer for a specific peer.
+    ///
+    /// This is the primary hook for implementing custom backpressure, flow control, and bitrate
+    /// monitoring on the outbound side. It is emitted whenever the reactor's internal outbound
+    /// buffer for a peer changes.
+    ///
+    /// This is not emitted unless enabled in the config.
+    OutboundTelemetry {
         /// The peer associated with the event.
         peer: PeerId,
         /// The number of bytes that can be queued without triggering a rejection.
-        available: usize,
+        /// **WARNING**: does not account for "ghost bytes", i.e. bytes that are on the way to the
+        /// reactor (in the handle channel) but not yet queued. Those have to be tracked manually.
+        free: usize,
+        /// The number of bytes currently queued in the outbound buffer.
+        queued: usize,
+        /// The number of bytes just added to (+) or removed from (-) the outbound buffer. `queued`
+        /// already takes this delta into account.
+        delta: isize,
+        /// The age of the oldest message in the outbound buffer. Age here means "the time that
+        /// elapsed since the message was queued".
+        oldest: Option<std::time::Instant>,
     },
 }
 
@@ -226,8 +237,6 @@ pub enum DisconnectReason {
     Left,
     /// The peer violated the protocol in some way, usually by sending a malformed message.
     CodecViolation,
-    /// The write side is stale, i.e. the peer is not reading the data we are sending.
-    WriteStale,
     /// An IO error occurred.
     Error(io::Error),
 }

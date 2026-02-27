@@ -327,6 +327,7 @@ fn expect_ping(event: Event<Message>, nonce: u64) -> PeerId {
             message: Message::Ping(p),
             peer,
             size,
+            time: _,
         } if nonce == p && size == 12 => peer,
         event => {
             panic!("expected Ping({nonce}) but got {:?}", event);
@@ -340,6 +341,7 @@ fn expect_pong(event: Event<Message>, nonce: u64) -> PeerId {
             message: Message::Pong(p),
             peer,
             size,
+            time: _,
         } if nonce == p && size == 12 => peer,
         event => {
             panic!("expected Pong({nonce}) but got {:?}", event);
@@ -353,6 +355,7 @@ fn read_ping(event: Event<Message>) -> (PeerId, u64) {
             message: Message::Ping(p),
             peer,
             size,
+            time: _,
         } if size == 12 => (peer, p),
         event => {
             panic!("expected Ping(_) but got {:?}", event);

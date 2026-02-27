@@ -95,7 +95,7 @@ where
         let waker = Arc::new(Waker::new(poll.registry(), scheduler::WAKER)?);
 
         let (cmd_sender, cmd_receiver) = channel(None);
-        let (event_sender, event_receiver) = channel(config.receive_channel_size);
+        let (event_sender, event_receiver) = channel(Some(config.receive_channel_size));
 
         let command_sender = IdleHandle {
             sender: cmd_sender,
@@ -210,9 +210,20 @@ where
                     SystemCommand::P2P(Command::Message(peer, message)) => {
                         match connection_manager.get_by_peer_id(&peer) {
                             Some(connection) => {
-                                if !connection.queue_message(&message, poll.registry())? {
+                                let (was_queued, bytes_queued_delta) =
+                                    connection.queue_message(&message, poll.registry())?;
+                                if !was_queued {
                                     sender.send(Event::QueueRejected { peer, message });
                                     log::debug!("message: send buffer for peer {peer} is full");
+                                } else if connection.config().outbound_telemetry {
+                                    let metrics = connection.outbound_metrics::<M>();
+                                    sender.send(Event::OutboundTelemetry {
+                                        peer,
+                                        queued: metrics.queued,
+                                        free: metrics.available,
+                                        delta: bytes_queued_delta as isize,
+                                        oldest: metrics.oldest,
+                                    });
                                 }
                             }
                             None => {
@@ -222,8 +233,12 @@ where
                         }
                     }
 
-                    SystemCommand::Shutdown => {
-                        connection_manager.shutdown(now);
+                    SystemCommand::Shutdown(termination) => {
+                        let timeout = match termination {
+                            Termination::Immediate => None,
+                            Termination::TryFlush(duration) => Some(duration),
+                        };
+                        connection_manager.shutdown(timeout);
                         return Ok(());
                     }
                 }
@@ -319,12 +334,13 @@ where
             if is_readable {
                 log::trace!("readable: peer {peer}");
 
-                match connection.read(&mut read_buf, |message, size| {
+                match connection.read(&mut read_buf, |message, size, time| {
                     log::debug!("read: peer {peer}: message={:?}", message);
                     sender.send(Event::Message {
                         peer,
                         message,
                         size,
+                        time,
                     });
                 }) {
                     Ok(maybe_read_carryover) => {
@@ -359,11 +375,17 @@ where
                 log::trace!("writeable: peer {peer}");
 
                 match connection.write(now, poll.registry(), token)? {
-                    Ok(carryover) => {
+                    Ok((carryover, written)) => {
                         write_carryover = carryover;
-                        if config.stream_config.notify_on_transmit {
-                            let available = connection.available::<M>();
-                            sender.send(Event::Transmitted { peer, available });
+                        if config.stream_config.outbound_telemetry {
+                            let metrics = connection.outbound_metrics::<M>();
+                            sender.send(Event::OutboundTelemetry {
+                                peer,
+                                free: metrics.available,
+                                queued: metrics.queued,
+                                delta: -(written as isize),
+                                oldest: metrics.oldest,
+                            });
                         }
                     }
                     Err(err) => {
@@ -392,12 +414,6 @@ where
                             std::io::ErrorKind::TimedOut,
                             "Connect attempt timed out",
                         )),
-                    });
-                }
-                connection::Dead::WriteStale(peer) => {
-                    sender.send(Event::Disconnected {
-                        peer,
-                        reason: DisconnectReason::WriteStale,
                     });
                 }
             }
@@ -429,7 +445,17 @@ enum SystemCommand<M: Message> {
     /// Various P2P commands.
     P2P(Command<M>),
     /// Close all connections and shut down the reactor.
-    Shutdown,
+    Shutdown(Termination),
+}
+
+/// Determines how the reactor should be shut down.
+#[derive(Debug, Clone, Copy)]
+pub enum Termination {
+    /// Shuts down the reactor immediately and tries to flush whatever was in the outbound buffers
+    /// without waiting further.
+    Immediate,
+    /// Shuts down the reactor but attempts to deliver all pending messages before closing.
+    TryFlush(std::time::Duration),
 }
 
 /// Describes the result of a connect attempt against a remote host.

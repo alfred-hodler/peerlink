@@ -93,7 +93,10 @@ fn shutdown_test(port: u16, shutdown_command: LeaveType, client_is_leaving: bool
                 .unwrap();
         }
         LeaveType::Shutdown => {
-            leaving.shutdown().1.unwrap();
+            leaving
+                .shutdown(peerlink::Termination::Immediate)
+                .1
+                .unwrap();
         }
         LeaveType::Abrupt => drop(leaving),
     }

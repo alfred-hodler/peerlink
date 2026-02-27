@@ -20,53 +20,59 @@ impl Message {
 impl peerlink::Message for Message {
     const MAX_SIZE: usize = 1024 * 1024 * 10 + 8;
 
-    fn encode(&self, dest: &mut impl std::io::Write) -> usize {
-        let mut written = 0;
-
-        let _ = dest.write_all(self.prefix());
-        written += self.prefix().len();
+    fn encode(&self, dest: &mut impl bytes::BufMut) {
+        dest.put_slice(self.prefix());
 
         match self {
             Message::Ping(p) | Message::Pong(p) => {
-                let _ = dest.write_all(&p.to_le_bytes());
-                written += 8;
+                dest.put_u64_le(*p);
             }
             Message::Data(data) => {
-                let _ = dest.write_all(&(data.len() as u32).to_le_bytes());
-                written += 4;
-                let _ = dest.write_all(data);
-                written += data.len();
+                dest.put_u32_le(data.len() as u32);
+                dest.put_slice(&data);
             }
         }
-
-        written
     }
 
-    fn decode(buffer: &[u8]) -> Result<(Self, usize), DecodeError> {
-        match buffer.get(0..4) {
-            Some(p @ b"ping" | p @ b"pong") => match buffer.get(4..12) {
+    fn decode(buffer: &mut impl bytes::Buf) -> Result<Self, DecodeError> {
+        let mut prefix = [0_u8; 4];
+        buffer
+            .try_copy_to_slice(&mut prefix)
+            .map_err(|_| peerlink::DecodeError::Partial)?;
+
+        match &prefix {
+            p @ b"ping" | p @ b"pong" => match buffer.try_get_u64_le().ok() {
                 Some(value) => {
-                    let value = u64::from_le_bytes(value.try_into().unwrap());
                     if p == b"ping" {
-                        Ok((Message::Ping(value), 12))
+                        Ok(Message::Ping(value))
                     } else {
-                        Ok((Message::Pong(value), 12))
+                        Ok(Message::Pong(value))
                     }
                 }
-                None => Err(DecodeError::NotEnoughData),
+                None => Err(DecodeError::Partial),
             },
-            Some(b"data") => match buffer.get(4..8) {
+            b"data" => match buffer.try_get_u32_le().ok() {
                 Some(length) => {
-                    let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
-                    match buffer.get(8..8 + length) {
-                        Some(data) => Ok((Message::Data(data.to_owned()), length + 8)),
-                        None => Err(DecodeError::NotEnoughData),
+                    let length = length as usize;
+                    if buffer.remaining() >= length {
+                        let mut data = vec![0_u8; length];
+                        buffer.copy_to_slice(&mut data);
+                        Ok(Message::Data(data.to_owned()))
+                    } else {
+                        Err(DecodeError::Partial)
                     }
                 }
-                None => Err(DecodeError::NotEnoughData),
+                None => Err(DecodeError::Partial),
             },
-            None => Err(DecodeError::NotEnoughData),
-            _ => Err(DecodeError::MalformedMessage),
+            _ => Err(DecodeError::Malformed),
+        }
+    }
+
+    fn wire_size(&self) -> usize {
+        match self {
+            Message::Ping(_) => 12,
+            Message::Pong(_) => 12,
+            Message::Data(items) => 4 + 4 + items.len(),
         }
     }
 }

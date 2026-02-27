@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use mio::Waker;
 
 use crate::reactor::SystemCommand;
-use crate::{Command, Event, Message};
+use crate::{Command, Event, Message, Termination};
 
 #[cfg(not(feature = "async"))]
 use crossbeam_channel::{Receiver, Sender};
@@ -81,8 +81,11 @@ impl<M: Message> Handle<M> {
     /// Shuts down the reactor and consumes the handle. No further commands can be sent afterward.
     /// Returns the join handle to the thread running the reactor, as well as whether the shutdown
     /// command was received. The latter erroring out means that the shutdown likely didn't go well.
-    pub fn shutdown(mut self) -> (JoinHandle<io::Result<()>>, Result<(), SendError>) {
-        let send_result = self.send_inner(SystemCommand::Shutdown);
+    pub fn shutdown(
+        mut self,
+        termination: Termination,
+    ) -> (JoinHandle<io::Result<()>>, Result<(), SendError>) {
+        let send_result = self.send_inner(SystemCommand::Shutdown(termination));
 
         (
             self.join_handle.take().expect("always present"),
@@ -114,9 +117,13 @@ impl<M: Message> Handle<M> {
 impl<M: Message> Drop for Handle<M> {
     fn drop(&mut self) {
         #[cfg(not(feature = "async"))]
-        let _ = self.sender.send(SystemCommand::Shutdown);
+        let _ = self
+            .sender
+            .send(SystemCommand::Shutdown(Termination::Immediate));
         #[cfg(feature = "async")]
-        let _ = self.sender.try_send(SystemCommand::Shutdown);
+        let _ = self
+            .sender
+            .try_send(SystemCommand::Shutdown(Termination::Immediate));
 
         let _ = self.waker.wake();
     }

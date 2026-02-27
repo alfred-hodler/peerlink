@@ -20,33 +20,36 @@ enum Message {
 impl peerlink::Message for Message {
     const MAX_SIZE: usize = 12;
 
-    fn encode(&self, dest: &mut impl std::io::Write) -> usize {
+    fn encode(&self, dest: &mut impl bytes::BufMut) {
         let (msg_type, value) = match &self {
             Message::Ping(p) => (b"ping", p),
             Message::Pong(p) => (b"pong", p),
         };
 
-        let mut written = 0;
-        written += dest.write(msg_type).unwrap();
-        written += dest.write(&value.to_le_bytes()).unwrap();
-        written
+        dest.put_slice(msg_type);
+        dest.put_u64_le(*value);
     }
 
-    fn decode(buffer: &[u8]) -> Result<(Self, usize), peerlink::DecodeError> {
-        const VALUE_OFFSET: usize = 4;
+    fn decode(buffer: &mut impl bytes::Buf) -> Result<Self, peerlink::DecodeError> {
         const MSG_LEN: usize = 12;
 
-        if buffer.len() >= MSG_LEN {
-            let value = u64::from_le_bytes(buffer[VALUE_OFFSET..MSG_LEN].try_into().unwrap());
+        if buffer.remaining() >= MSG_LEN {
+            let mut prefix = [0_u8; 4];
+            buffer.copy_to_slice(&mut prefix);
+            let value = buffer.get_u64_le();
 
-            match &buffer[0..4] {
-                b"ping" => Ok((Message::Ping(value), MSG_LEN)),
-                b"pong" => Ok((Message::Pong(value), MSG_LEN)),
-                _ => Err(peerlink::DecodeError::MalformedMessage),
+            match &prefix {
+                b"ping" => Ok(Message::Ping(value)),
+                b"pong" => Ok(Message::Pong(value)),
+                _ => Err(peerlink::DecodeError::Malformed),
             }
         } else {
-            Err(peerlink::DecodeError::NotEnoughData)
+            Err(peerlink::DecodeError::Partial)
         }
+    }
+
+    fn wire_size(&self) -> usize {
+        4 + 8
     }
 }
 
@@ -60,7 +63,7 @@ fn server() -> Result<(), Error> {
     let handle = peerlink::run::<_>(Config {
         bind_addr: vec![bind_addr],
         stream_config: peerlink::StreamConfig {
-            notify_on_transmit: true,
+            outbound_telemetry: true,
             ..Default::default()
         },
         ..Default::default()
@@ -84,6 +87,7 @@ fn server() -> Result<(), Error> {
                 peer,
                 message,
                 size,
+                time: _,
             } => match message {
                 Message::Ping(p) => {
                     assert_eq!(size, 12);
@@ -96,8 +100,8 @@ fn server() -> Result<(), Error> {
                 }
             },
 
-            Event::Transmitted { available, .. } => {
-                println!("Server transmitted, available={}", available);
+            Event::OutboundTelemetry { free, delta, .. } => {
+                println!("Server transmitted, free={}, delta={}", free, delta);
             }
             _ => {}
         }

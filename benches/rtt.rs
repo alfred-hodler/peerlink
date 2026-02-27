@@ -9,25 +9,30 @@ struct Message(Vec<u8>);
 impl peerlink::Message for Message {
     const MAX_SIZE: usize = 100 * 1024 * 1024;
 
-    fn encode(&self, dest: &mut impl std::io::Write) -> usize {
-        let mut written = 0;
-        written += dest.write(&(self.0.len() as u64).to_le_bytes()).unwrap();
-        dest.write_all(&self.0).unwrap();
-        written += self.0.len();
-        written
+    fn encode(&self, dest: &mut impl bytes::BufMut) {
+        dest.put_u64_le(self.0.len() as u64);
+        dest.put_slice(&self.0);
     }
 
-    fn decode(buffer: &[u8]) -> Result<(Self, usize), peerlink::DecodeError> {
-        if buffer.len() >= 8 {
-            let size = u64::from_le_bytes(buffer[..8].try_into().unwrap()) as usize;
+    fn decode(buffer: &mut impl bytes::Buf) -> Result<Self, peerlink::DecodeError> {
+        let size = buffer
+            .try_get_u64_le()
+            .map_err(|_| peerlink::DecodeError::Partial)? as usize;
 
-            match buffer.get(8..8 + size) {
-                Some(data) => Ok((Self(data.to_owned()), 8 + size)),
-                None => Err(peerlink::DecodeError::NotEnoughData),
+        if buffer.remaining() >= size {
+            let mut data = Vec::with_capacity(size);
+            unsafe {
+                data.set_len(size);
             }
+            buffer.copy_to_slice(&mut data);
+            Ok(Self(data))
         } else {
-            Err(peerlink::DecodeError::NotEnoughData)
+            Err(peerlink::DecodeError::Partial)
         }
+    }
+
+    fn wire_size(&self) -> usize {
+        8 + self.0.len()
     }
 }
 
@@ -97,6 +102,7 @@ fn client(mut args: pico_args::Arguments) -> Result<(), Error> {
                 message,
                 peer,
                 size,
+                time: _,
             } => {
                 if round > 0 {
                     rtt.push(Instant::now() - start);
@@ -124,7 +130,12 @@ fn client(mut args: pico_args::Arguments) -> Result<(), Error> {
     stats.print();
     println!("Total size: {total_size} bytes");
 
-    handle.shutdown().0.join().unwrap().unwrap();
+    handle
+        .shutdown(peerlink::Termination::TryFlush(Duration::from_secs(5)))
+        .0
+        .join()
+        .unwrap()
+        .unwrap();
 
     Ok(())
 }

@@ -1,6 +1,8 @@
 use std::io::{self, Read, Write};
 use std::num::NonZeroU8;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use bytes::Buf;
 
 use crate::{DecodeError, Message};
 
@@ -29,18 +31,14 @@ pub struct StreamConfig {
     /// is important for outbound backpressure control. Defaults to 2 x [`Message::MAX_SIZE`].
     pub tx_buf_max_size: MaxMessageSizeMultiple,
 
-    /// The duration after which a peer is disconnected if it fails to read our data.
-    pub tx_timeout: std::time::Duration,
-
     /// The duration after which a connect attempt is abandoned. Applies only to non-blocking
     /// connect attempts. Blocking ones performed in custom connectors ignore this value.
     pub connect_timeout: std::time::Duration,
 
-    /// Whether an event should be emitted every time data leaves the send buffer. This event
-    /// contains information on how much data can be queued without rejection in that moment. Useful
-    /// for fine-grained backpressure control.
-    /// The event emitted is [`Event::Transmitted`](super::Event::Transmitted).
-    pub notify_on_transmit: bool,
+    /// Whether an event should be emitted every time data enters and leaves the send buffer for the
+    /// peer. Useful for fine grained flow control and backpressure control. The event emitted is
+    /// [`Event::OutboundTelemetry`](super::Event::OutboundTelemetry).
+    pub outbound_telemetry: bool,
 }
 
 /// A deferred size expressed as a multiple of the protocol's maximum message size
@@ -52,6 +50,13 @@ pub struct StreamConfig {
 pub struct MaxMessageSizeMultiple(pub NonZeroU8);
 
 impl MaxMessageSizeMultiple {
+    pub const ONE: Self = Self(NonZeroU8::new(1).unwrap());
+    pub const TWO: Self = Self(NonZeroU8::new(2).unwrap());
+    pub const THREE: Self = Self(NonZeroU8::new(3).unwrap());
+    pub const FOUR: Self = Self(NonZeroU8::new(4).unwrap());
+}
+
+impl MaxMessageSizeMultiple {
     pub fn compute<M: Message>(&self) -> usize {
         (self.0.get() as usize) * M::MAX_SIZE
     }
@@ -61,12 +66,11 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             rx_buf_min_size: 4 * 1024,
-            rx_buf_max_size: MaxMessageSizeMultiple(NonZeroU8::new(1).unwrap()),
+            rx_buf_max_size: MaxMessageSizeMultiple::ONE,
             tx_buf_min_size: 4 * 1024,
-            tx_buf_max_size: MaxMessageSizeMultiple(NonZeroU8::new(2).unwrap()),
-            tx_timeout: std::time::Duration::from_secs(30),
+            tx_buf_max_size: MaxMessageSizeMultiple::TWO,
             connect_timeout: std::time::Duration::from_secs(5),
-            notify_on_transmit: false,
+            outbound_telemetry: false,
         }
     }
 }
@@ -80,15 +84,17 @@ pub struct MessageStream<T: Read + Write> {
     /// The read+write stream underlying the connection.
     stream: T,
     /// Buffer used for message reconstruction.
-    rx_msg_buf: readbuf::ReadBuf,
+    rx_msg_buf: shiftbuf::ShiftBuf,
     /// Buffer used for sending.
-    tx_msg_buf: readbuf::ReadBuf,
+    tx_msg_buf: shiftbuf::ShiftBuf,
     /// The list of queue points for outgoing messages.
     tx_queue_points: queue_points::Queue,
     /// Cached readyness.
     ready: bool,
     /// Last successful write time.
     last_write: Instant,
+    /// The time the current message frame started coming in.
+    frame_time: Instant,
 }
 
 #[derive(Debug)]
@@ -110,13 +116,15 @@ pub enum ReadError {
 impl<T: Read + Write> MessageStream<T> {
     /// Creates a new [`Stream`] instance.
     pub fn new(stream: T, config: StreamConfig) -> Self {
+        let now = Instant::now();
         Self {
             stream,
             rx_msg_buf: Default::default(),
             tx_msg_buf: Default::default(),
             tx_queue_points: Default::default(),
             ready: false,
-            last_write: Instant::now(),
+            last_write: now,
+            frame_time: now,
             config,
         }
     }
@@ -127,7 +135,7 @@ impl<T: Read + Write> MessageStream<T> {
     /// Attempts to read from a connection and decode messages in a fair manner.
     ///
     /// Returns whether there is more work available.
-    pub fn read<M: Message, F: Fn(M, usize)>(
+    pub fn read<M: Message, F: Fn(M, usize, Duration)>(
         &mut self,
         rx_buf: &mut [u8],
         on_msg: F,
@@ -165,22 +173,28 @@ impl<T: Read + Write> MessageStream<T> {
         };
 
         // for now we always decode as much as we can so we don't care about this result
-        let _decode_has_more = if !preexisting {
-            let (consumed, result) = decode_from_buffer(&rx_buf[..total_read], on_msg)?;
+        let now = Instant::now();
+        if !preexisting {
+            let consumed = decode_from_buffer(&mut &rx_buf[..total_read], on_msg, None)?;
             if consumed < total_read {
                 self.rx_msg_buf.put(&rx_buf[consumed..total_read]);
+                self.frame_time = now;
             }
-            result
         } else {
-            self.rx_msg_buf.put(&rx_buf[..total_read]);
-            let (consumed, result) = decode_from_buffer(self.rx_msg_buf.data(), on_msg)?;
-            self.rx_msg_buf.advance(consumed);
+            let mut buf =
+                spanned_view::SpannedView::new(self.rx_msg_buf.data(), &rx_buf[..total_read]);
+            let consumed = decode_from_buffer(&mut buf, on_msg, Some(self.frame_time))?;
+            self.frame_time = now;
+            let a_consumed = consumed.min(self.rx_msg_buf.len());
+            let b_consumed = consumed - a_consumed;
+            let b_remainder = total_read - b_consumed;
+            self.rx_msg_buf.advance(a_consumed);
             if self.rx_msg_buf.is_empty() {
                 self.rx_msg_buf.clear();
-            } else {
-                self.rx_msg_buf.smart_shift();
             }
-            result
+            if b_remainder > 0 {
+                self.rx_msg_buf.put(&rx_buf[b_consumed..total_read]);
+            }
         };
 
         read_result
@@ -189,36 +203,38 @@ impl<T: Read + Write> MessageStream<T> {
     /// Writes out as many bytes from the send buffer as possible, until blocking would start or
     /// some write budget is exceeded.
     ///
-    /// Returns the status of the write.
-    pub fn write(&mut self, now: Instant) -> io::Result<WriteResult> {
+    /// Returns the status of the write and how many bytes were written out.
+    pub fn write(&mut self, now: Instant) -> io::Result<(WriteResult, usize)> {
         if !self.has_queued_data() {
-            return Ok(WriteResult::Done);
+            return Ok((WriteResult::Done, 0));
         }
 
         let mut write_budget: usize = 128 * 1024;
         let mut syscall_budget: u8 = 8;
+        let mut total_written = 0;
 
         loop {
             match self.try_write(now) {
                 Ok(written) => {
+                    total_written += written;
                     let has_more = self.has_queued_data();
                     log::trace!("wrote out {written} bytes, has more: {}", has_more);
 
                     if !has_more {
                         self.tx_msg_buf.clear();
-                        break Ok(WriteResult::Done);
+                        break Ok((WriteResult::Done, total_written));
                     } else {
                         write_budget = write_budget.saturating_sub(written);
                         syscall_budget -= 1;
                         if write_budget == 0 || syscall_budget == 0 {
-                            break Ok(WriteResult::BudgetExceeded);
+                            break Ok((WriteResult::BudgetExceeded, total_written));
                         }
                     }
                 }
 
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     log::trace!("write would block");
-                    break Ok(WriteResult::WouldBlock);
+                    break Ok((WriteResult::WouldBlock, total_written));
                 }
 
                 Err(err) => break Err(err),
@@ -230,40 +246,41 @@ impl<T: Read + Write> MessageStream<T> {
     /// the internal buffer. [`write`] must be called when the socket is writeable in order to flush.
     ///
     /// Returns `true` if the write buffer contains enough space to accept the message, or `false`
-    /// if the buffer is full and the message cannot be queued at this time.
-    ///
-    /// Note that if a message has a [`Message::size_hint`] implementation, the size hint is used to
-    /// determine whether the message will be accepted into the send buffer. If a message does
-    /// not have a size hint, two scenarios exist:
-    ///   - The buffer is not full -- the message is encoded and placed into the buffer even if
-    ///     that will exceed its maximum size and push it past the configured limits.
-    ///   - The buffer is full -- the message will not be encoded and queued.
+    /// if the buffer is full and the message cannot be queued at this time. The second field
+    /// returned denotes how many bytes exactly were queued.
     #[must_use]
-    pub fn queue_message<M: Message>(&mut self, message: &M) -> bool {
-        self.tx_msg_buf.smart_shift();
-        let size_hint = message.size_hint().unwrap_or_default();
-        if size_hint + self.tx_msg_buf.len() >= self.config.tx_buf_max_size.compute::<M>() {
-            false
+    pub fn queue_message<M: Message>(&mut self, message: &M) -> (bool, usize) {
+        let size = message.wire_size();
+        let available = self.available::<M>();
+        if available < size {
+            (false, 0)
         } else {
-            let encoded = message.encode(self.tx_msg_buf.as_writer());
+            let pre_encode_len = self.tx_msg_buf.len();
+            message.encode(&mut self.tx_msg_buf);
+            let encoded = self.tx_msg_buf.len() - pre_encode_len;
+            if encoded != size {
+                if cfg!(debug_assertions) {
+                    panic!(
+                        "encoded size ({}) was not equal to predicted size ({})",
+                        encoded, size
+                    );
+                } else {
+                    log::warn!(
+                        "encoded size ({}) was not equal to predicted size ({})",
+                        encoded,
+                        size
+                    );
+                }
+            }
             self.tx_queue_points.append(encoded);
-            true
+            (true, encoded)
         }
     }
 
     /// Returns how many bytes can be queued immediately with respect to transmit buffer size limit.
-    pub fn available<M: Message>(&self) -> usize {
-        let max_size = self.config.tx_buf_max_size.compute::<M>();
-        max_size - self.tx_msg_buf.len()
-    }
-
-    /// Returns whether the stream is stale on the write side, i.e. the data is not leaving the
-    /// send buffer in a timely manner.
-    pub fn is_write_stale(&self, now: Instant) -> bool {
-        self.tx_queue_points.first().is_some_and(|t| {
-            let timeout = self.config.tx_timeout;
-            (now - t > self.config.tx_timeout) && (now - self.last_write > timeout)
-        })
+    #[inline(always)]
+    fn available<M: Message>(&self) -> usize {
+        self.config.tx_buf_max_size.compute::<M>() - self.tx_msg_buf.len()
     }
 
     /// Resizes and shrinks the capacity of internal send and receive buffers by 1/4, until the
@@ -287,11 +304,35 @@ impl<T: Read + Write> MessageStream<T> {
         Ok(written)
     }
 
-    /// Returns whether the send buffer has more data to write.
+    /// Exposes the config.
+    pub fn config(&self) -> &StreamConfig {
+        &self.config
+    }
+
+    /// Returns whether the outbound buffer has more data queued.
     #[inline(always)]
     pub fn has_queued_data(&self) -> bool {
         !self.tx_msg_buf.is_empty()
     }
+
+    /// Returns various metrics on the outbound buffer.
+    #[inline(always)]
+    pub fn outbound_metrics<M: Message>(&self) -> OutboundMetrics {
+        OutboundMetrics {
+            available: self.available::<M>(),
+            queued: self.tx_msg_buf.len(),
+            oldest: self.tx_queue_points.first(),
+        }
+    }
+}
+
+pub struct OutboundMetrics {
+    /// How many bytes can be queued immediately with respect to tx buffer size limit.
+    pub available: usize,
+    /// The number of currently queued bytes.
+    pub queued: usize,
+    /// The time the oldest queueud byte, if any.
+    pub oldest: Option<Instant>,
 }
 
 pub enum WriteResult {
@@ -303,21 +344,35 @@ pub enum WriteResult {
     BudgetExceeded,
 }
 
-fn decode_from_buffer<M: Message, F: Fn(M, usize)>(
-    buffer: &[u8],
+fn decode_from_buffer<M: Message, F: Fn(M, usize, Duration)>(
+    buffer: &mut impl bytes::Buf,
     on_msg: F,
-) -> Result<(usize, bool), ReadError> {
-    let mut cursor: usize = 0;
+    first_frame: Option<Instant>,
+) -> Result<usize, ReadError> {
+    let mut is_first_frame = true;
+    let mut total_consumed: usize = 0;
     loop {
-        match M::decode(&buffer[cursor..]) {
-            Ok((message, consumed)) => {
-                cursor += consumed;
-                on_msg(message, consumed);
+        let pre = buffer.remaining();
+        match M::decode(buffer) {
+            Ok(message) => {
+                let duration = if is_first_frame && let Some(first_frame) = first_frame {
+                    is_first_frame = false;
+                    first_frame.elapsed()
+                } else {
+                    Duration::ZERO
+                };
+                let consumed = pre - buffer.remaining();
+                total_consumed += consumed;
+                on_msg(message, consumed, duration);
             }
-            Err(DecodeError::NotEnoughData) => {
-                break Ok((cursor, false)); // not ready in the next round as far as we know
+            Err(DecodeError::Partial) => {
+                if pre >= M::MAX_SIZE {
+                    break Err(ReadError::MalformedMessage);
+                } else {
+                    break Ok(total_consumed);
+                }
             }
-            Err(DecodeError::MalformedMessage) => {
+            Err(DecodeError::Malformed) => {
                 break Err(ReadError::MalformedMessage);
             }
         }
@@ -442,16 +497,16 @@ mod queue_points {
     }
 }
 
-mod readbuf {
+mod shiftbuf {
     /// A buffer implementation that enables multiple, individual reads to happen without having
     /// to clear the read data from the head. This can be done lazily when opportune instead.
     #[derive(Debug, Default)]
-    pub struct ReadBuf {
+    pub struct ShiftBuf {
         buf: Vec<u8>,
         cursor: usize,
     }
 
-    impl ReadBuf {
+    impl ShiftBuf {
         /// Returns the view of data that has not been read yet.
         pub fn data(&self) -> &[u8] {
             &self.buf[self.cursor..]
@@ -483,13 +538,14 @@ mod readbuf {
         /// Moves the yet unread data forward, discarding any previously read data.
         /// This operation only has an effect if the "junk" (already consumed) data takes up more
         /// than one third of space in the buffer.
+        #[inline(always)]
         pub fn smart_shift(&mut self) {
             if self.cursor > 0 && !self.buf.is_empty() && self.cursor >= self.buf.len() / 3 {
                 self.shift();
             }
         }
 
-        /// Shrinks the buffer by one third, with respect to some floor.
+        /// Shrinks the buffer by one quarter, with respect to some floor.
         pub fn shrink(&mut self, min: usize) {
             if self.cursor > 0 {
                 self.shift();
@@ -499,11 +555,6 @@ mod readbuf {
                 let shrink_to = 3 * (self.buf.capacity() / 4);
                 self.buf.shrink_to(min.max(shrink_to));
             }
-        }
-
-        /// Exposes the buffer as [`std::io::Write`].
-        pub fn as_writer(&mut self) -> &mut impl std::io::Write {
-            &mut self.buf
         }
 
         pub fn put(&mut self, data: &[u8]) {
@@ -518,15 +569,45 @@ mod readbuf {
         }
     }
 
+    unsafe impl bytes::BufMut for ShiftBuf {
+        #[inline]
+        fn remaining_mut(&self) -> usize {
+            isize::MAX as usize - self.len()
+        }
+
+        #[inline]
+        unsafe fn advance_mut(&mut self, cnt: usize) {
+            let new_len = self.buf.len() + cnt;
+            assert!(new_len <= self.buf.capacity());
+            unsafe { self.buf.set_len(new_len) };
+        }
+
+        #[inline]
+        fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+            self.smart_shift();
+            if self.buf.len() == self.buf.capacity() {
+                self.buf.reserve(64);
+            }
+
+            let cap = self.buf.capacity();
+            let len = self.buf.len();
+
+            unsafe {
+                let ptr = self.buf.as_mut_ptr().add(len);
+                bytes::buf::UninitSlice::from_raw_parts_mut(ptr, cap - len)
+            }
+        }
+    }
+
     #[cfg(test)]
     #[test]
     fn buffer_test() {
-        use std::io::Write;
-        let mut buffer = ReadBuf::default();
+        use bytes::BufMut;
+        let mut buffer = ShiftBuf::default();
 
         assert_eq!(buffer.len(), 0);
 
-        buffer.as_writer().write(b"test 123").unwrap();
+        buffer.put_slice(b"test 123");
         assert_eq!(buffer.len(), 8);
         assert_eq!(buffer.data(), b"test 123");
 
@@ -555,9 +636,45 @@ mod readbuf {
         assert_eq!(buffer.data(), b"");
         assert_eq!(buffer.buf, b"");
 
-        assert_eq!(buffer.buf.capacity(), 8);
+        assert_eq!(buffer.buf.capacity(), 64);
         buffer.shrink(4);
-        assert!(buffer.buf.capacity() >= 4 && buffer.buf.capacity() < 8);
+        assert!(buffer.buf.capacity() >= 4 && buffer.buf.capacity() < 64);
+    }
+}
+
+/// Contains a data structure providing a contiguous view over two disjointed slices.
+mod spanned_view {
+    /// A lightweight wrapper that logically concatenates two byte slices into a single readable
+    /// stream without allocation.
+    pub struct SpannedView<'a> {
+        a: &'a [u8],
+        b: &'a [u8],
+        cursor: usize,
+    }
+
+    impl<'a> SpannedView<'a> {
+        pub fn new(a: &'a [u8], b: &'a [u8]) -> Self {
+            Self { a, b, cursor: 0 }
+        }
+    }
+
+    impl<'a> bytes::Buf for SpannedView<'a> {
+        fn remaining(&self) -> usize {
+            (self.a.len() + self.b.len()) - self.cursor
+        }
+
+        fn chunk(&self) -> &[u8] {
+            if self.cursor < self.a.len() {
+                &self.a[self.cursor..]
+            } else {
+                let b_cursor = self.cursor - self.a.len();
+                &self.b[b_cursor..]
+            }
+        }
+
+        fn advance(&mut self, cnt: usize) {
+            self.cursor += cnt;
+        }
     }
 }
 
@@ -574,48 +691,53 @@ mod test {
     impl Message for Ping {
         const MAX_SIZE: usize = 8;
 
-        fn encode(&self, dest: &mut impl std::io::Write) -> usize {
-            dest.write(&self.0.to_le_bytes()).unwrap()
+        fn encode(&self, dest: &mut impl bytes::BufMut) {
+            dest.put_u64_le(self.0);
         }
 
-        fn decode(buffer: &[u8]) -> Result<(Self, usize), DecodeError> {
-            if buffer.len() >= 8 {
-                Ok((Ping(u64::from_le_bytes(buffer[..8].try_into().unwrap())), 8))
-            } else {
-                Err(DecodeError::NotEnoughData)
+        fn decode(buffer: &mut impl bytes::Buf) -> Result<Self, DecodeError> {
+            match buffer.try_get_u64_le() {
+                Ok(v) => Ok(Ping(v)),
+                Err(_) => Err(DecodeError::Partial),
             }
+        }
+
+        fn wire_size(&self) -> usize {
+            8
         }
     }
 
     #[test]
     fn reassemble_message_whole_reads() {
         let mut buf = [0; 1024];
-        let mut cursor = Cursor::new(Vec::new());
+        let mut cursor = Vec::new();
 
         Ping(0).encode(&mut cursor);
         Ping(1).encode(&mut cursor);
-        cursor.set_position(0);
 
-        let mut conn = MessageStream::new(&mut cursor, StreamConfig::default());
+        let mut conn = MessageStream::new(Cursor::new(cursor), StreamConfig::default());
 
         let received: RefCell<Vec<Ping>> = Default::default();
-        conn.read(&mut buf, |message, size| {
+        conn.read(&mut buf, |message, size, time| {
             assert_eq!(size, 8);
+            assert_eq!(time, Duration::ZERO);
             received.borrow_mut().push(message);
         })
         .unwrap();
 
         assert_eq!(received.borrow()[0], Ping(0));
 
-        conn.read(&mut buf, |message, size| {
+        conn.read(&mut buf, |message, size, time| {
             assert_eq!(size, 8);
+            assert_eq!(time, Duration::ZERO);
             received.borrow_mut().push(message);
         })
         .unwrap();
         assert_eq!(received.borrow()[1], Ping(1));
 
-        let err = conn.read(&mut buf, |message, size| {
+        let err = conn.read(&mut buf, |message, size, time| {
             assert_eq!(size, 8);
+            assert_eq!(time, Duration::ZERO);
             received.borrow_mut().push(message);
         });
         assert!(matches!(err, Err(ReadError::EndOfStream)));
@@ -635,22 +757,25 @@ mod test {
         let received: RefCell<Vec<Ping>> = Default::default();
 
         conn.stream.get_mut().extend_from_slice(&serialized[..4]);
-        let _ = conn.read(&mut buf, |message, size| {
+        let _ = conn.read(&mut buf, |message, size, time| {
             assert_eq!(size, 8);
+            assert_eq!(time, Duration::ZERO);
             received.borrow_mut().push(message);
         });
         assert!(received.borrow().is_empty());
         assert_eq!(conn.rx_msg_buf.len(), 4);
 
         conn.stream.get_mut().extend_from_slice(&serialized[4..]);
-        let _ = conn.read(&mut buf, |message, size| {
+        let _ = conn.read(&mut buf, |message, size, time| {
             assert_eq!(size, 8);
+            assert!(time != Duration::ZERO);
             received.borrow_mut().push(message);
         });
         assert_eq!(received.borrow()[0], Ping(u64::MAX - 1));
 
-        let _ = conn.read(&mut buf, |message, size| {
+        let _ = conn.read(&mut buf, |message, size, time| {
             assert_eq!(size, 8);
+            assert_eq!(time, Duration::ZERO);
             received.borrow_mut().push(message);
         });
         assert_eq!(received.borrow()[1], Ping(u64::MAX));
@@ -662,14 +787,14 @@ mod test {
         let mut connection = MessageStream::new(
             &mut wire,
             StreamConfig {
-                tx_buf_max_size: MaxMessageSizeMultiple(3.try_into().unwrap()),
+                tx_buf_max_size: MaxMessageSizeMultiple::THREE,
                 ..Default::default()
             },
         );
 
-        assert!(connection.queue_message(&Ping(0)));
-        assert!(connection.queue_message(&Ping(1)));
-        assert!(connection.queue_message(&Ping(2)));
+        assert_eq!(connection.queue_message(&Ping(0)), (true, 8));
+        assert_eq!(connection.queue_message(&Ping(1)), (true, 8));
+        assert_eq!(connection.queue_message(&Ping(2)), (true, 8));
 
         let cloned_buffer = connection.tx_msg_buf.data().to_vec();
         connection.write(Instant::now()).unwrap();
@@ -682,13 +807,13 @@ mod test {
         let mut wire = Cursor::new(Vec::<u8>::new());
         let config = StreamConfig {
             tx_buf_min_size: 1,
-            tx_buf_max_size: MaxMessageSizeMultiple(1.try_into().unwrap()),
+            tx_buf_max_size: MaxMessageSizeMultiple::ONE,
             ..Default::default()
         };
         let mut connection = MessageStream::new(&mut wire, config);
 
-        assert!(connection.queue_message(&Ping(0)));
-        assert!(!connection.queue_message(&Ping(1)));
+        assert_eq!(connection.queue_message(&Ping(0)), (true, 8));
+        assert_eq!(connection.queue_message(&Ping(1)), (false, 0));
 
         let buffer_len = connection.tx_msg_buf.len();
         let cloned_buffer = connection.tx_msg_buf.data().to_vec();
@@ -702,13 +827,13 @@ mod test {
         let mut wire = Cursor::new(Vec::<u8>::new());
         let config = StreamConfig {
             tx_buf_min_size: 1,
-            tx_buf_max_size: MaxMessageSizeMultiple(1.try_into().unwrap()),
+            tx_buf_max_size: MaxMessageSizeMultiple::ONE,
             ..Default::default()
         };
         let mut connection = MessageStream::new(&mut wire, config);
 
-        assert!(connection.queue_message(&Ping(0)));
-        assert!(!connection.queue_message(&Ping(1)));
+        assert_eq!(connection.queue_message(&Ping(0)), (true, 8));
+        assert_eq!(connection.queue_message(&Ping(1)), (false, 0));
 
         assert_eq!(connection.available::<Ping>(), 0);
         connection.write(Instant::now()).unwrap();
