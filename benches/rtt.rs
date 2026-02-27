@@ -9,12 +9,9 @@ struct Message(Vec<u8>);
 impl peerlink::Message for Message {
     const MAX_SIZE: usize = 100 * 1024 * 1024;
 
-    fn encode(&self, dest: &mut impl std::io::Write) -> usize {
-        let mut written = 0;
-        written += dest.write(&(self.0.len() as u64).to_le_bytes()).unwrap();
+    fn encode(&self, dest: &mut impl std::io::Write) {
+        dest.write(&(self.0.len() as u64).to_le_bytes()).unwrap();
         dest.write_all(&self.0).unwrap();
-        written += self.0.len();
-        written
     }
 
     fn decode(buffer: &[u8]) -> Result<(Self, usize), peerlink::DecodeError> {
@@ -28,6 +25,10 @@ impl peerlink::Message for Message {
         } else {
             Err(peerlink::DecodeError::NotEnoughData)
         }
+    }
+
+    fn wire_size(&self) -> usize {
+        8 + self.0.len()
     }
 }
 
@@ -124,7 +125,12 @@ fn client(mut args: pico_args::Arguments) -> Result<(), Error> {
     stats.print();
     println!("Total size: {total_size} bytes");
 
-    handle.shutdown().0.join().unwrap().unwrap();
+    handle
+        .shutdown(peerlink::Termination::TryFlush(Duration::from_secs(5)))
+        .0
+        .join()
+        .unwrap()
+        .unwrap();
 
     Ok(())
 }

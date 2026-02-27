@@ -20,26 +20,18 @@ impl Message {
 impl peerlink::Message for Message {
     const MAX_SIZE: usize = 1024 * 1024 * 10 + 8;
 
-    fn encode(&self, dest: &mut impl std::io::Write) -> usize {
-        let mut written = 0;
-
+    fn encode(&self, dest: &mut impl std::io::Write) {
         let _ = dest.write_all(self.prefix());
-        written += self.prefix().len();
 
         match self {
             Message::Ping(p) | Message::Pong(p) => {
                 let _ = dest.write_all(&p.to_le_bytes());
-                written += 8;
             }
             Message::Data(data) => {
                 let _ = dest.write_all(&(data.len() as u32).to_le_bytes());
-                written += 4;
                 let _ = dest.write_all(data);
-                written += data.len();
             }
         }
-
-        written
     }
 
     fn decode(buffer: &[u8]) -> Result<(Self, usize), DecodeError> {
@@ -67,6 +59,14 @@ impl peerlink::Message for Message {
             },
             None => Err(DecodeError::NotEnoughData),
             _ => Err(DecodeError::MalformedMessage),
+        }
+    }
+
+    fn wire_size(&self) -> usize {
+        match self {
+            Message::Ping(_) => 12,
+            Message::Pong(_) => 12,
+            Message::Data(items) => 4 + 4 + items.len(),
         }
     }
 }

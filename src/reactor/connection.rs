@@ -52,22 +52,23 @@ impl Connection {
     /// Queues a message for sending. This method simply encodes the message and places it into
     /// the internal buffer. [`write`] must be called when the socket is writeable in order to flush.
     ///
-    /// Returns `true` if the write buffer contains enough space to accept the message, or `false`
-    /// if the buffer is full and the message cannot be queued at this time.
+    /// Returns whether the message was queued successfully or rejected due to a lack of space in
+    /// the buffer, along with the number of bytes added to the buffer.
     pub fn queue_message<M: Message>(
         &mut self,
         message: &M,
         registry: &Registry,
-    ) -> io::Result<bool> {
-        if self.stream.queue_message(message) {
+    ) -> io::Result<(bool, usize)> {
+        let (queued, n_bytes) = self.stream.queue_message(message);
+        if queued {
             registry.reregister(
                 self.stream.as_source(),
                 self.token,
                 Interest::READABLE | Interest::WRITABLE,
             )?;
-            Ok(true)
+            Ok((true, n_bytes))
         } else {
-            Ok(false)
+            Ok((false, n_bytes))
         }
     }
 
@@ -78,23 +79,28 @@ impl Connection {
 
     /// Writes out as many bytes from the send buffer as possible, until blocking would start.
     ///
-    /// Returns whether more write work is available immediately (without blocking). Encountering an
-    /// error here means the connection must be discarded.
+    /// Returns whether more write work is available immediately (without blocking) and how many
+    /// bytes were written out. Encountering an error here means the connection must be discarded.
     pub fn write(
         &mut self,
         now: Instant,
         registry: &Registry,
         token: Token,
-    ) -> io::Result<io::Result<bool>> {
+    ) -> io::Result<io::Result<(bool, usize)>> {
         match self.stream.write(now) {
-            Ok(WriteResult::Done) => {
+            Ok((WriteResult::Done, written)) => {
                 registry.reregister(self.stream.as_source(), token, Interest::READABLE)?;
-                Ok(Ok(false))
+                Ok(Ok((false, written)))
             }
-            Ok(WriteResult::WouldBlock) => Ok(Ok(false)),
-            Ok(WriteResult::BudgetExceeded) => Ok(Ok(true)),
+            Ok((WriteResult::WouldBlock, written)) => Ok(Ok((false, written))),
+            Ok((WriteResult::BudgetExceeded, written)) => Ok(Ok((true, written))),
             Err(err) => Ok(Err(err)),
         }
+    }
+
+    /// Exposes the stream config.
+    pub fn config(&self) -> &StreamConfig {
+        self.stream.config()
     }
 
     /// Utility function that returns a peer if for a connection, if one has been established.
@@ -382,17 +388,38 @@ impl Manager {
     }
 
     /// Shuts down every connection.
-    pub fn shutdown(self, now: Instant) {
-        for (token, mut connection) in self.connections {
-            let _ = connection.stream.write(now);
-            if connection
-                .stream
-                .is_write_stale(now + Duration::from_secs(3600))
-            {
-                log::debug!("shutdown: connection had unsent data");
+    pub fn shutdown(mut self, timeout: Option<Duration>) {
+        let start = Instant::now();
+
+        if let Some(timeout) = timeout {
+            while start.elapsed() < timeout {
+                for (_, connection) in &mut self.connections {
+                    let _ = connection.stream.write(start);
+                }
+
+                let data_remaining = self
+                    .connections
+                    .iter()
+                    .any(|(_, c)| c.stream.has_queued_data());
+
+                if data_remaining {
+                    std::thread::sleep(Duration::from_millis(10));
+                } else {
+                    break;
+                }
+            }
+        }
+
+        log::debug!("shutdown: lingered for {}ms", start.elapsed().as_millis());
+
+        for (token, connection) in self.connections {
+            if connection.stream.has_queued_data() {
+                log::warn!(
+                    "shutdown: stream {} still has unsent data (timed out)",
+                    token
+                );
             }
             let shutdown_result = connection.stream.shutdown();
-
             log::debug!("shutdown: stream {}: {:?}", token, shutdown_result);
         }
     }

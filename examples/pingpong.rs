@@ -20,16 +20,14 @@ enum Message {
 impl peerlink::Message for Message {
     const MAX_SIZE: usize = 12;
 
-    fn encode(&self, dest: &mut impl std::io::Write) -> usize {
+    fn encode(&self, dest: &mut impl std::io::Write) {
         let (msg_type, value) = match &self {
             Message::Ping(p) => (b"ping", p),
             Message::Pong(p) => (b"pong", p),
         };
 
-        let mut written = 0;
-        written += dest.write(msg_type).unwrap();
-        written += dest.write(&value.to_le_bytes()).unwrap();
-        written
+        dest.write(msg_type).unwrap();
+        dest.write(&value.to_le_bytes()).unwrap();
     }
 
     fn decode(buffer: &[u8]) -> Result<(Self, usize), peerlink::DecodeError> {
@@ -48,6 +46,10 @@ impl peerlink::Message for Message {
             Err(peerlink::DecodeError::NotEnoughData)
         }
     }
+
+    fn wire_size(&self) -> usize {
+        4 + 8
+    }
 }
 
 // The server consists of a reactor listening to events in a loop and replying to pings with pongs.
@@ -60,7 +62,7 @@ fn server() -> Result<(), Error> {
     let handle = peerlink::run::<_>(Config {
         bind_addr: vec![bind_addr],
         stream_config: peerlink::StreamConfig {
-            notify_on_transmit: true,
+            outbound_telemetry: true,
             ..Default::default()
         },
         ..Default::default()
@@ -96,8 +98,13 @@ fn server() -> Result<(), Error> {
                 }
             },
 
-            Event::Transmitted { available, .. } => {
-                println!("Server transmitted, available={}", available);
+            Event::OutboundTelemetry {
+                available, delta, ..
+            } => {
+                println!(
+                    "Server transmitted, available={}, delta={}",
+                    available, delta
+                );
             }
             _ => {}
         }

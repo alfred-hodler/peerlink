@@ -18,8 +18,8 @@ use std::{io, net::SocketAddr, num::NonZeroUsize};
 
 use crate::connector::Target;
 
-pub use message_stream::StreamConfig;
-pub use reactor::{Handle, RecvError, SendError, run, run_with_connector};
+pub use message_stream::{MaxMessageSizeMultiple, StreamConfig};
+pub use reactor::{Handle, RecvError, SendError, Termination, run, run_with_connector};
 
 #[cfg(feature = "socks")]
 pub use reactor::run_with_socks5_proxy;
@@ -78,9 +78,7 @@ pub trait Message: std::fmt::Debug + Sized + Send + Sync + 'static {
 
     /// Encodes a message into a writer. This is an in-memory sink that never panics so there is no
     /// need to handle the error path.
-    ///
-    /// Returns the number of encoded bytes.
-    fn encode(&self, sink: &mut impl std::io::Write) -> usize;
+    fn encode(&self, sink: &mut impl std::io::Write);
 
     /// Provides access to the underlying read buffer. The buffer may contain any number of
     /// messages, including no messages at all or only a partial message. If there are enough bytes
@@ -94,14 +92,10 @@ pub trait Message: std::fmt::Debug + Sized + Send + Sync + 'static {
     /// returned. Such peers are disconnected as protocol violators.
     fn decode(buffer: &[u8]) -> Result<(Self, usize), DecodeError>;
 
-    /// If a message has a known size ahead of encoding, that value can be set here. This is useful
-    /// for outbound backpressure control, so that a message is not preemptively encoded and placed
-    /// into the send buffer only to be realized that the size of the send buffer will be exceeding
-    /// its maximum. Getting this wrong can interfere with outbound backpressure control, so if the
-    /// value is not certain, it is better not to override the method.
-    fn size_hint(&self) -> Option<usize> {
-        None
-    }
+    /// The size of the encoded message (serialized size). Setting this correctly is paramount for
+    /// correct backpressure control. Setting this incorrectly will mess with outbound backpressure
+    /// control.
+    fn wire_size(&self) -> usize;
 }
 
 /// Possible reasons why a message could not be decoded at a particular time.
@@ -208,12 +202,22 @@ pub enum Event<M: Message> {
         message: M,
     },
 
-    /// Some data has left the send buffer for a peer. This is only emitted if config enabled.
-    Transmitted {
+    /// Telemetry on the outbound data pipeline for a specific peer.
+    ///
+    /// This is the primary hook for implementing custom backpressure, flow control, and bitrate
+    /// monitoring. It is emitted whenever the reactor's internal outbound buffer for a peer
+    /// changes.
+    ///
+    /// This is not emitted unless enabled in the config.
+    OutboundTelemetry {
         /// The peer associated with the event.
         peer: PeerId,
         /// The number of bytes that can be queued without triggering a rejection.
+        /// **WARNING**: does not account for "ghost bytes", i.e. bytes that are on the way to the
+        /// reactor (in the handle channel) but not yet queued.
         available: usize,
+        /// The number of bytes added to (+) or removed from (-) the outbound pipeline.
+        delta: isize,
     },
 }
 

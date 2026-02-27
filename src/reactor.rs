@@ -210,9 +210,17 @@ where
                     SystemCommand::P2P(Command::Message(peer, message)) => {
                         match connection_manager.get_by_peer_id(&peer) {
                             Some(connection) => {
-                                if !connection.queue_message(&message, poll.registry())? {
+                                let (was_queued, bytes_queued) =
+                                    connection.queue_message(&message, poll.registry())?;
+                                if !was_queued {
                                     sender.send(Event::QueueRejected { peer, message });
                                     log::debug!("message: send buffer for peer {peer} is full");
+                                } else if connection.config().outbound_telemetry {
+                                    sender.send(Event::OutboundTelemetry {
+                                        peer,
+                                        available: connection.available::<M>(),
+                                        delta: bytes_queued as isize,
+                                    });
                                 }
                             }
                             None => {
@@ -222,8 +230,12 @@ where
                         }
                     }
 
-                    SystemCommand::Shutdown => {
-                        connection_manager.shutdown(now);
+                    SystemCommand::Shutdown(termination) => {
+                        let timeout = match termination {
+                            Termination::Immediate => None,
+                            Termination::TryFlush(duration) => Some(duration),
+                        };
+                        connection_manager.shutdown(timeout);
                         return Ok(());
                     }
                 }
@@ -359,11 +371,15 @@ where
                 log::trace!("writeable: peer {peer}");
 
                 match connection.write(now, poll.registry(), token)? {
-                    Ok(carryover) => {
+                    Ok((carryover, written)) => {
                         write_carryover = carryover;
-                        if config.stream_config.notify_on_transmit {
+                        if config.stream_config.outbound_telemetry {
                             let available = connection.available::<M>();
-                            sender.send(Event::Transmitted { peer, available });
+                            sender.send(Event::OutboundTelemetry {
+                                peer,
+                                available,
+                                delta: -(written as isize),
+                            });
                         }
                     }
                     Err(err) => {
@@ -429,7 +445,17 @@ enum SystemCommand<M: Message> {
     /// Various P2P commands.
     P2P(Command<M>),
     /// Close all connections and shut down the reactor.
-    Shutdown,
+    Shutdown(Termination),
+}
+
+/// Determines how the reactor should be shut down.
+#[derive(Debug, Clone, Copy)]
+pub enum Termination {
+    /// Shuts down the reactor immediately and tries to flush whatever was in the outbound buffers
+    /// without waiting further.
+    Immediate,
+    /// Shuts down the reactor but attempts to deliver all pending messages before closing.
+    TryFlush(std::time::Duration),
 }
 
 /// Describes the result of a connect attempt against a remote host.
