@@ -27,8 +27,7 @@ impl<M: Message> Handle<M> {
         self.send_inner(SystemCommand::P2P(command))
     }
 
-    /// Blocks until the reactor associated with this handle produces a message. If an error is
-    /// produced, the reactor is irrecoverable.
+    /// Blocks until the reactor associated with this handle produces an event.
     pub fn recv_blocking(&self) -> Result<Event<M>, RecvError> {
         #[cfg(not(feature = "async"))]
         let result = self.receiver.recv();
@@ -38,8 +37,7 @@ impl<M: Message> Handle<M> {
         result.map_err(|_| RecvError)
     }
 
-    /// Attempts to immediately receive a message. If the inner option is `None`, it means the
-    /// channel was empty. If there is a `RecvError`, the reactor is irrecoverable.
+    /// Attempts to immediately receive an event and returns without blocking if there isn't one.
     pub fn try_recv(&self) -> Result<Option<Event<M>>, RecvError> {
         #[cfg(feature = "async")]
         use async_channel::TryRecvError;
@@ -56,11 +54,13 @@ impl<M: Message> Handle<M> {
         }
     }
 
+    /// Receives an event. Used in the async world.
     #[cfg(feature = "async")]
     pub async fn recv_async(&self) -> Result<Event<M>, RecvError> {
         self.receiver.recv().await.map_err(|_| RecvError)
     }
 
+    /// Receives an event with a timeout (blocks for `duration`).
     #[cfg(not(feature = "async"))]
     pub async fn recv_timeout(
         &self,
@@ -129,6 +129,30 @@ impl<M: Message> Drop for Handle<M> {
     }
 }
 
+/// A non-blocking iterator over currently available events. Yields events until the receive portion
+/// of the handle is drained.
+pub struct EventIter<'a, M: Message> {
+    handle: &'a Handle<M>,
+}
+
+impl<'a, M: Message> Iterator for EventIter<'a, M> {
+    type Item = Result<Event<M>, RecvError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.handle.try_recv().transpose()
+    }
+}
+
+impl<'a, M: Message> IntoIterator for &'a Handle<M> {
+    type Item = Result<Event<M>, RecvError>;
+    type IntoIter = EventIter<'a, M>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        EventIter { handle: self }
+    }
+}
+
+/// A handle variant whose reactor has not yet been started.
 pub struct IdleHandle<M: Message> {
     pub waker: Arc<Waker>,
     pub sender: Sender<SystemCommand<M>>,
@@ -146,13 +170,16 @@ impl<M: Message> IdleHandle<M> {
     }
 }
 
+/// Produced when a send operation on a handle fails.
 #[derive(Debug)]
 pub enum SendError {
     /// The channel to the reactor is currently full and cannot accept more messages.
     Full,
-    /// The other side of the channel is disconnected (reactor is likely dead).
+    /// The other side of the channel is disconnected (reactor is irrecoverable/dead).
     Dead,
 }
 
+/// Produced when a reactor is dead or otherwise irrecoverable and the associated handle is no
+/// longer connected.
 #[derive(Debug)]
 pub struct RecvError;

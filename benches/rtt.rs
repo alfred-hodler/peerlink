@@ -4,27 +4,23 @@ use std::time::{Duration, Instant};
 use peerlink::{Command, Config, Event};
 
 #[derive(Debug)]
-struct Message(Vec<u8>);
+struct Msg(bytes::Bytes);
 
-impl peerlink::Message for Message {
-    const MAX_SIZE: usize = 100 * 1024 * 1024;
+impl peerlink::Message for Msg {
+    const MAX_SIZE: usize = 4 + 1024 * 1024;
 
     fn encode(&self, dest: &mut impl bytes::BufMut) {
-        dest.put_u64_le(self.0.len() as u64);
+        dest.put_u32_le(self.0.len() as u32);
         dest.put_slice(&self.0);
     }
 
     fn decode(buffer: &mut impl bytes::Buf) -> Result<Self, peerlink::DecodeError> {
         let size = buffer
-            .try_get_u64_le()
+            .try_get_u32_le()
             .map_err(|_| peerlink::DecodeError::Partial)? as usize;
 
         if buffer.remaining() >= size {
-            let mut data = Vec::with_capacity(size);
-            unsafe {
-                data.set_len(size);
-            }
-            buffer.copy_to_slice(&mut data);
+            let data = buffer.copy_to_bytes(size);
             Ok(Self(data))
         } else {
             Err(peerlink::DecodeError::Partial)
@@ -32,15 +28,15 @@ impl peerlink::Message for Message {
     }
 
     fn wire_size(&self) -> usize {
-        8 + self.0.len()
+        4 + self.0.len()
     }
 }
 
-fn server() -> Result<(), Error> {
+fn responder(_: pico_args::Arguments) -> Result<(), Error> {
     let bind_addr = "127.0.0.1:8080".parse().unwrap();
-    println!("Server: starting to listen on address {}", bind_addr);
+    eprintln!("Server: starting to listen on address {}", bind_addr);
 
-    let handle = peerlink::run::<Message>(Config {
+    let handle = peerlink::run::<Msg>(Config {
         bind_addr: vec![bind_addr],
         stream_config: peerlink::StreamConfig::default(),
         ..Default::default()
@@ -49,14 +45,15 @@ fn server() -> Result<(), Error> {
     loop {
         match handle.recv_blocking().unwrap() {
             Event::ConnectedFrom { peer, addr, .. } => {
-                println!("Inbound peer connect: peer_id={} ip={}", peer, addr);
+                eprintln!("Inbound peer connect: peer_id={} ip={}", peer, addr);
             }
 
             Event::Disconnected { peer, reason } => {
-                println!(
+                eprintln!(
                     "Inbound peer disconnect: peer_id={}, reason={:?}",
                     peer, reason
                 );
+                break;
             }
 
             Event::Message { peer, message, .. } => {
@@ -66,10 +63,12 @@ fn server() -> Result<(), Error> {
             _ => {}
         }
     }
+
+    Ok(())
 }
 
-fn client(mut args: pico_args::Arguments) -> Result<(), Error> {
-    let rounds: u32 = args.value_from_str("--rounds")?;
+fn initiator(mut args: pico_args::Arguments) -> Result<(), Error> {
+    let count: u32 = args.value_from_str("--count")?;
     let size: u32 = args.value_from_str("--size")?;
 
     let handle = peerlink::run(Config::default())?;
@@ -82,16 +81,19 @@ fn client(mut args: pico_args::Arguments) -> Result<(), Error> {
             target,
             result: Ok(peer_id),
         } if target == server_addr.into() => {
-            println!("Connected to server at {}", target);
+            eprintln!("Connected to server at {}", target);
             peer_id
         }
 
         event => panic!("Unexpected event: {:?}", event),
     };
 
-    handle.send(Command::Message(peer_id, Message(vec![1; size as usize])))?;
     let mut start = Instant::now();
-    let mut rtt = Vec::with_capacity(rounds as usize);
+    let mut rtt = Vec::with_capacity(count as usize);
+
+    let metrics = BenchMetrics::start();
+    let data: bytes::Bytes = vec![1; size as usize].into();
+    handle.send(Command::Message(peer_id, Msg(data.clone())))?;
 
     let mut round = 0;
     let mut total_size: u64 = 0;
@@ -112,13 +114,13 @@ fn client(mut args: pico_args::Arguments) -> Result<(), Error> {
                 round += 1;
                 total_size += size as u64;
 
-                if round > rounds {
+                if round == count {
                     break;
                 }
             }
 
             Event::Disconnected { .. } => {
-                println!("The server has disconnected, exiting.");
+                eprintln!("The server has disconnected, exiting.");
                 break;
             }
 
@@ -126,9 +128,7 @@ fn client(mut args: pico_args::Arguments) -> Result<(), Error> {
         }
     }
 
-    let stats = Stats::analyze(rtt);
-    stats.print();
-    println!("Total size: {total_size} bytes");
+    metrics.stop(total_size as u64, round as u64, rtt);
 
     handle
         .shutdown(peerlink::Termination::TryFlush(Duration::from_secs(5)))
@@ -146,10 +146,10 @@ fn main() -> Result<(), Error> {
     let command = args.subcommand()?;
 
     match command.as_deref() {
-        Some("client") => client(args),
-        Some("server") => server(),
+        Some("initiator") => initiator(args),
+        Some("responder") => responder(args),
         _ => {
-            eprintln!("The first arg must be either 'client' or 'server'");
+            eprintln!("The first arg must be either 'initator' or 'responder'");
             Ok(())
         }
     }
@@ -211,13 +211,139 @@ impl Stats {
             p95: data[(len as f64 * 0.95) as usize],
         }
     }
+}
 
-    fn print(&self) {
-        println!("---- stats ----");
-        println!("min: {} μs", self.min.as_micros());
-        println!("max: {} μs", self.max.as_micros());
-        println!("avg: {} μs", self.mean.as_micros());
-        println!("med: {} μs", self.median.as_micros());
-        println!("p95: {} μs", self.p95.as_micros());
+pub struct BenchMetrics {
+    start_time: Instant,
+    start_usage: libc::rusage,
+}
+
+impl BenchMetrics {
+    pub fn start() -> Self {
+        unsafe {
+            let mut usage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+            Self {
+                start_time: Instant::now(),
+                start_usage: usage,
+            }
+        }
+    }
+
+    pub fn stop(&self, total_bytes: u64, total_msgs: u64, timings: Vec<Duration>) {
+        let end_time = Instant::now();
+        let mut end_usage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut end_usage) };
+
+        self.print_report(total_bytes, total_msgs, end_time, end_usage, timings);
+    }
+
+    fn timeval_delta_to_duration(start: libc::timeval, end: libc::timeval) -> Duration {
+        let start_dur = Duration::new(start.tv_sec as u64, start.tv_usec as u32 * 1000);
+        let end_dur = Duration::new(end.tv_sec as u64, end.tv_usec as u32 * 1000);
+        end_dur.saturating_sub(start_dur)
+    }
+
+    fn print_report(
+        &self,
+        total_bytes: u64,
+        total_msgs: u64,
+        end_time: Instant,
+        end_usage: libc::rusage,
+        timings: Vec<Duration>,
+    ) {
+        fn fmt_bytes(bytes: u64) -> String {
+            format!("{:.2}", bytesize::ByteSize::b(bytes).display().iec())
+        }
+
+        let wall_time = end_time.duration_since(self.start_time);
+
+        // Calculate deltas for CPU time
+        let user_time =
+            Self::timeval_delta_to_duration(self.start_usage.ru_utime, end_usage.ru_utime);
+        let sys_time =
+            Self::timeval_delta_to_duration(self.start_usage.ru_stime, end_usage.ru_stime);
+        let total_cpu = user_time + sys_time;
+
+        // Calculate deltas for context switches
+        let vol_ctx = end_usage.ru_nvcsw - self.start_usage.ru_nvcsw;
+        let invol_ctx = end_usage.ru_nivcsw - self.start_usage.ru_nivcsw;
+
+        let wall_secs = wall_time.as_secs_f64().max(0.001);
+        let cpu_secs = total_cpu.as_secs_f64();
+        let cpu_usage_pct = (cpu_secs / wall_secs) * 100.0;
+        let bytes_per_sec = (total_bytes as f64 / wall_secs) as u64;
+
+        // Derived Efficiency Metrics
+        let mib_transferred = total_bytes as f64 / (1024.0 * 1024.0);
+        let cpu_ms_per_mb = cpu_secs * 1000.0 / mib_transferred;
+        let cpu_micros_per_msg = (cpu_secs * 1e6) / total_msgs as f64;
+        let msgs_per_ctx_switch = total_msgs as f64 / (vol_ctx + invol_ctx) as f64;
+
+        // Timings
+        let timings = Stats::analyze(timings);
+
+        println!("{:-^60}", " ROUND TRIP BENCHMARK REPORT ");
+
+        // --- SECTION 1: EXECUTION TIME ---
+        println!("\n[ EXECUTION TIME ]");
+        println!("{:<30} : {:.3}s", "Wall Time", wall_time.as_secs_f64());
+        println!("{:<30} : {:.3}s", "User Time", user_time.as_secs_f64());
+        println!("{:<30} : {:.3}s", "Kernel Time", sys_time.as_secs_f64());
+        println!("{:<30} : {:.2}%", "Total CPU Utilization", cpu_usage_pct);
+
+        // --- SECTION 2: NETWORK PERFORMANCE ---
+        println!("\n[ NETWORK PERFORMANCE ]");
+        println!(
+            "{:<30} : {}",
+            "Average message size",
+            fmt_bytes(total_bytes / total_msgs)
+        );
+        println!("{:<30} : {}", "Total Data", fmt_bytes(total_bytes));
+        println!("{:<30} : {}", "Total Message Count", total_msgs);
+        println!(
+            "{:<30} : {}/s",
+            "Throughput (Bandwidth)",
+            fmt_bytes(bytes_per_sec)
+        );
+        println!(
+            "{:<30} : {:.2} msgs/s",
+            "Message Rate",
+            total_msgs as f64 / wall_secs
+        );
+
+        // --- SECTION 3: SYSTEM RESOURCES ---
+        println!("\n[ RESOURCE UTILIZATION ]");
+        println!("{:<30} : {}", "Voluntary Ctx Switches", vol_ctx);
+        println!("{:<30} : {}", "Involuntary Ctx Switches", invol_ctx);
+
+        // --- SECTION 4: PROTOCOL EFFICIENCY ---
+        println!("\n[ PROTOCOL EFFICIENCY ]");
+        println!(
+            "{:<30} : {:.2} ms/MiB",
+            "Compute Cost (per MiB)", cpu_ms_per_mb
+        );
+        println!(
+            "{:<30} : {:.2} µs/msg",
+            "Compute Cost (per Message)", cpu_micros_per_msg
+        );
+        println!(
+            "{:<30} : {:.2} msgs/switch",
+            "I/O Batching Efficiency", msgs_per_ctx_switch
+        );
+
+        // System Overhead Ratio: How much of our CPU time was spent in the Kernel vs User?
+        let sys_ratio = (sys_time.as_secs_f64() / cpu_secs) * 100.0;
+        println!("{:<30} : {:.2}%", "Kernel Overhead Ratio", sys_ratio);
+
+        // --- SECTION 5: TIMINGS STATS ---
+        println!("\n[ TIMINGS ]");
+        println!("{:<30} : {:.2} µs", "Min", timings.min.as_micros());
+        println!("{:<30} : {:.2} µs", "Max", timings.max.as_micros());
+        println!("{:<30} : {:.2} µs", "Avg", timings.mean.as_micros());
+        println!("{:<30} : {:.2} µs", "Med", timings.median.as_micros());
+        println!("{:<30} : {:.2} µs", "p95", timings.p95.as_micros());
+
+        println!("\n{:-^60}\n", "");
     }
 }

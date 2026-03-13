@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# parameters are count, size, senders
+# parameters are size, count, senders
 BENCHMARK_SETS=(
     "1024        10000000    3"
     "10240       1000000     3"
